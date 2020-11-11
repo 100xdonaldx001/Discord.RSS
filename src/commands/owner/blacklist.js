@@ -1,55 +1,46 @@
-const storage = require('../../util/storage.js')
-const dbOpsBlacklists = require('../../util/db/blacklists.js')
-const log = require('../../util/logger.js')
+const Blacklist = require('../../structs/db/Blacklist.js')
+const createLogger = require('../../util/logger/create.js')
 
-exports.normal = async (bot, message) => {
+module.exports = async (message) => {
   const content = message.content.split(' ')
   if (content.length !== 2) return
   const id = content[1]
-  try {
-    const guild = bot.guilds.get(id)
-    const user = bot.users.get(id)
-    if (!guild && !user) return await message.channel.send('No such guild or user exists.')
-    else if (guild && storage.blacklistGuilds.includes(id)) return await message.channel.send(`Guild ${id} (${user.username}) is already blacklisted.`)
-    else if (user && storage.blacklistUsers.includes(id)) return await message.channel.send(`User ${id} (${user.username}) is already blacklisted.`)
-
-    await dbOpsBlacklists.add({ isGuild: !!guild, id: id, name: guild ? guild.name : user.username })
-    if (guild) guild.leave().catch(err => log.general.warning(`Unable to leave guild after blacklisted`, guild, err))
-    log.owner.info(`Added ${guild ? `guild ${id} named "${guild.name}"` : `user ${id} named "${user.username}`}" to blacklist`, message.author)
-    await message.channel.send(`Added ${guild ? `guild ${id} named "${guild.name}"` : `user ${id} named "${user.username}`}" to blacklist`).catch(err => log.owner.warning('blacklist 2', err))
-  } catch (err) {
-    log.owner.warning('blacklist', err)
-    if (err.code !== 50013) message.channel.send(err.message).catch(err => log.owner.warning('blacklist 1a', message.guild, err))
+  const blacklisted = await Blacklist.get(id)
+  if (blacklisted) {
+    return message.channel.send('ID is already blacklisted.')
   }
-}
-
-exports.sharded = async (bot, message, Manager) => {
-  const content = message.content.split(' ')
-  if (content.length !== 2) return
-  const id = content[1]
-  try {
-    const results = await bot.shard.broadcastEval(`
-      const guild = this.guilds.get('${id}');
-      const user = this.users.get('${id}');
-      guild.leave();
-      guild ? '_guild ' + guild.name : user ? '_user ' + user.username : null
-    `)
-    let found
-    for (var x = 0; x < results.length; ++x) {
-      if (!results[x]) continue
-      const arr = results[x].split(' ')
-      const type = arr.shift().replace('_', '')
-      found = { type: type, name: arr.join(' ') }
+  const data = {
+    _id: id
+  }
+  const log = createLogger(message.guild.shard.id)
+  const guildResults = await message.client.shard.broadcastEval(`this.guilds.cache.get('${id}') ? this.guilds.cache.get('${id}').name : null`)
+  const matchedGuilds = guildResults.filter(g => g)
+  if (matchedGuilds.length > 0) {
+    data.type = Blacklist.TYPES.GUILD
+    data.name = matchedGuilds[0]
+  } else {
+    /**
+     * @type {import('discord.js').Client}
+     */
+    const client = message.client
+    try {
+      const user = await client.users.fetch(id)
+      data.type = Blacklist.TYPES.USER
+      data.name = user.username
+    } catch (err) {
+      log.owner({
+        error: err
+      }, `No guild or user found for ${id}. User fetch result:`)
+      return message.channel.send(`No guild or user found for id ${id}.`)
     }
-    if (!found) return await message.channel.send('No such guild or user exists.')
-    else if (found.type === 'guild' && storage.blacklistGuilds.includes(id)) return await message.channel.send(`Guild ${id} (${found.name}) is already blacklisted.`)
-    else if (found.type === 'user' && storage.blacklistUsers.includes(id)) return await message.channel.send(`User ${id} (${found.name}) is already blacklisted.`)
-
-    await dbOpsBlacklists.add({ isGuild: found.type === 'guild', id: id, name: found.name })
-    log.owner.info(`Added ${found.type} ${id} named "${found.name}" to blacklist`, message.author)
-    await message.channel.send(`Added ${found.type} ${id} named "${found.name}" to blacklist`).catch(err => log.owner.warning('blacklist 2', err))
-  } catch (err) {
-    log.owner.warning('blacklist', err)
-    if (err.code !== 50013) message.channel.send(err.message).catch(err => log.owner.warning('blacklist 1b', message.guild, err))
   }
+
+  const blacklist = new Blacklist(data)
+  await blacklist.save()
+
+  log.owner({
+    guild: message.guild,
+    user: message.author
+  }, `Added ${data.type} ${id} named "${data.name}" to blacklist`)
+  await message.channel.send(`Added ${data.type === 0 ? 'user' : 'guild'} ${id} named "${data.name}" to blacklist. Restart bot to take effect.`)
 }

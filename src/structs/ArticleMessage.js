@@ -1,74 +1,84 @@
-const config = require('../config.js')
 const Discord = require('discord.js')
-const storage = require('../util/storage.js')
-const log = require('../util/logger.js')
-const debugFeeds = require('../util/debugFeeds.js').list
 const Article = require('./Article.js')
-const deletedFeeds = storage.deletedFeeds
-const testFilters = require('../rss/translator/filters.js')
-
-/**
- * @typedef {Object} PreparedArticle
- * @property {string} rssName - The feed ID where this article came from
- * @property {Object} _delivery - Delivery details
- * @property {Object} _delivery.source - The feed source where this article came from
- * @property {string} _delivery.rssName - The feed ID where this article came from
- */
+const getConfig = require('../config.js').get
+const createLogger = require('../util/logger/create.js')
+const devLevels = require('../util/devLevels.js')
+const Feed = require('./db/Feed.js')
+const FeedData = require('./FeedData.js')
 
 class ArticleMessage {
   /**
-   * @param {PreparedArticle} article - The article object
-   * @param {boolean} isTestMessage - Whether this should skip filters AND have test details
-   * @param {boolean} skipFilters - Whether this should skip filters
+   * @param {Object<string, any>} article
+   * @param {import('./FeedData.js')} feedData
+   * @param {boolean} [debug]
    */
-  constructor (article, isTestMessage = false, skipFilters = false) {
-    if (!article._delivery) throw new Error('article._delivery property missing')
-    if (!article._delivery.rssName) throw new Error('article._delivery.rssName property missing')
-    if (!article._delivery.source) throw new Error('article._delivery.source property missing')
+  constructor (article, feedData, debug = false) {
+    this.config = getConfig()
+    this.debug = debug
     this.article = article
-    this.isTestMessage = isTestMessage
-    this.skipFilters = skipFilters || isTestMessage
-    this.channelId = article._delivery.source.channel
-    this.channel = storage.bot.channels.get(article._delivery.source.channel)
-    if (!this.channel) return
-    this.webhook = undefined
-    this.sendFailed = 1
-    this.rssName = article._delivery.rssName
-    this.source = article._delivery.source
-    this.toggleRoleMentions = typeof this.source.toggleRoleMentions === 'boolean' ? this.source.toggleRoleMentions : config.feeds.toggleRoleMentions
-    this.split = this.source.splitMessage // The split options if the message exceeds the character limit. If undefined, do not split, otherwise it is an object with keys char, prepend, append
-    this.parsedArticle = new Article(article, this.source, this.article._delivery.source.dateSettings)
-    this.subscriptionIds = this.parsedArticle.subscriptionIds
-
-    this.filterResults = testFilters(this.source.filters, this.parsedArticle)
-    this.passedFilters = this.source.filters && !this.skipFilters ? this.filterResults.passed : true
-
-    const { embeds, text } = this._generateMessage()
-    this.text = text
-    this.embeds = embeds
-    this.testDetails = isTestMessage ? this._generateTestMessage() : ''
+    this.feed = feedData.feed
+    this.filteredFormats = feedData.filteredFormats
+    this.sendFailed = 0
+    this.parsedArticle = new Article(article, feedData)
   }
 
-  static get TEST_OPTIONS () {
-    return { split: { prepend: '```md\n', append: '```' } }
+  /**
+   * @param {import('./db/Feed.js')|Object<string, any>} feed
+   * @param {Object<string, any>} article
+   * @param {boolean} [debug]
+   */
+  static async create (feed, article, debug) {
+    if (feed instanceof Feed) {
+      const feedData = await FeedData.ofFeed(feed)
+      return new ArticleMessage(article, feedData, debug)
+    } else {
+      const reconstructedFeed = new Feed(feed)
+      const feedData = await FeedData.ofFeed(reconstructedFeed)
+      return new ArticleMessage(article, feedData, debug)
+    }
   }
 
-  _determineFormat () {
-    const { source, parsedArticle } = this
-    let textFormat = source.message === undefined ? source.message : source.message.trim()
-    let embedFormat = source.embeds
+  passedFilters () {
+    const { filters, rfilters } = this.feed
+    if (Object.keys(rfilters).length > 0) {
+      return this.parsedArticle.testFilters(rfilters).passed
+    } else {
+      return this.parsedArticle.testFilters(filters).passed
+    }
+  }
+
+  /**
+   * @param {import('discord.js').Client} bot
+   */
+  getChannel (bot) {
+    const channel = bot.channels.cache.get(this.feed.channel)
+    return channel
+  }
+
+  determineFormat () {
+    const { feed, parsedArticle, filteredFormats } = this
+    let text = feed.text || this.config.feeds.defaultText
+    let embeds = feed.embeds
 
     // See if there are any filter-specific messages
-    if (Array.isArray(source.filteredFormats)) {
-      let matched = { }
+    if (filteredFormats.length > 0) {
+      const matched = { }
       let highestPriority = -1
       let selectedFormat
-      const filteredFormats = source.filteredFormats
       for (const filteredFormat of filteredFormats) {
-        const thisPriority = filteredFormat.priority === undefined || filteredFormat.priority < 0 ? 0 : filteredFormat.priority
-        const res = testFilters(filteredFormat.filters, parsedArticle) // messageFiltered.filters must exist as an object
-        if (!res.passed) continue
-        matched[thisPriority] = matched[thisPriority] === undefined ? 1 : matched[thisPriority] + 1
+        let thisPriority = filteredFormat.priority
+        if (thisPriority === undefined || thisPriority < 0) {
+          thisPriority = 0
+        }
+        const res = parsedArticle.testFilters(filteredFormat.filters)
+        if (!res.passed) {
+          continue
+        }
+        if (matched[thisPriority] === undefined) {
+          matched[thisPriority] = 1
+        } else {
+          ++matched[thisPriority]
+        }
         if (thisPriority >= highestPriority) {
           highestPriority = thisPriority
           selectedFormat = filteredFormat
@@ -76,24 +86,25 @@ class ArticleMessage {
       }
       // Only formats with 1 match will get the filtered format
       if (highestPriority > -1 && matched[highestPriority] === 1) {
-        textFormat = selectedFormat.message === true ? textFormat : selectedFormat.message // If it's true, then it will use the feed's (or the config default, if applicable) message
-        embedFormat = selectedFormat.embeds === true ? embedFormat : selectedFormat.embeds
+        // If it's undefined, then it will use the feed's (or the config default, if applicable) message
+        if (selectedFormat.text) {
+          text = selectedFormat.text
+        }
+        if (selectedFormat.embeds) {
+          embeds = selectedFormat.embeds
+        }
       }
     }
 
-    if (!textFormat) {
-      textFormat = config.feeds.defaultMessage.trim()
-    }
-
-    return { textFormat, embedFormat }
+    return { text, embeds }
   }
 
-  _convertEmbeds (embeds) {
+  convertEmbeds (embeds) {
     const { parsedArticle } = this
     const richEmbeds = []
     const convert = parsedArticle.convertKeywords.bind(parsedArticle)
     for (const objectEmbed of embeds) {
-      const richEmbed = new Discord.RichEmbed()
+      const richEmbed = new Discord.MessageEmbed()
 
       const title = convert(objectEmbed.title)
       if (title) {
@@ -111,56 +122,63 @@ class ArticleMessage {
       }
 
       const color = objectEmbed.color
-      if (color !== null && color !== undefined && !isNaN(color) && color <= 16777215 && color >= 0) {
+      if (color !== null && color !== undefined && color <= 16777215 && color >= 0) {
         richEmbed.setColor(parseInt(color, 10))
-      } else if (color && color.startsWith('#') && color.length === 7) {
-        richEmbed.setColor(color)
       }
 
-      const footerText = convert(objectEmbed.footer_text || objectEmbed.footerText)
-      const footerIconURL = convert(objectEmbed.footer_icon_url || objectEmbed.footerIconUrl)
+      const footerText = convert(objectEmbed.footerText)
       if (footerText) {
+        const footerIconURL = convert(objectEmbed.footerIconURL)
         richEmbed.setFooter(footerText, footerIconURL)
       }
 
-      const authorName = convert(objectEmbed.author_name || objectEmbed.authorName)
-      const authorIconURL = convert(objectEmbed.author_icon_url || objectEmbed.authorIconUrl)
-      const authorURL = convert(objectEmbed.author_url || objectEmbed.authorUrl)
+      const authorName = convert(objectEmbed.authorName)
       if (authorName) {
+        const authorIconURL = convert(objectEmbed.authorIconURL)
+        const authorURL = convert(objectEmbed.authorURL)
         richEmbed.setAuthor(authorName, authorIconURL, authorURL)
       }
 
-      const thumbnailURL = convert(objectEmbed.thumbnail_url || objectEmbed.thumbnailUrl)
+      const thumbnailURL = convert(objectEmbed.thumbnailURL)
       if (thumbnailURL) {
         richEmbed.setThumbnail(thumbnailURL)
       }
 
-      const imageURL = convert(objectEmbed.image_url || objectEmbed.imageUrl)
+      const imageURL = convert(objectEmbed.imageURL)
       if (imageURL) {
         richEmbed.setImage(imageURL)
       }
 
       const timestamp = objectEmbed.timestamp
-      if (timestamp) {
-        richEmbed.setTimestamp(timestamp === 'article' ? new Date(parsedArticle._fullDate) : timestamp === 'now' ? new Date() : new Date(timestamp)) // No need to check for invalid date since discord.js does it
+      if (timestamp === 'article') {
+        richEmbed.setTimestamp(new Date(parsedArticle.fullDate))
+      } else if (timestamp === 'now') {
+        richEmbed.setTimestamp(new Date())
       }
 
       const fields = objectEmbed.fields
       if (Array.isArray(fields)) {
-        for (var x = 0; x < fields.length; ++x) {
-          const field = fields[x]
+        for (const field of fields) {
           const inline = field.inline === true
 
-          let title = convert(field.title)
-          title = title.length > 256 ? title.slice(0, 250) + '...' : title
+          let name = convert(field.name)
+          if (name.length > 256) {
+            name = name.slice(0, 250) + '...'
+          } else if (field.name && !name) {
+            // If a placeholder is empty
+            name = '\u200b'
+          }
 
-          let value = convert(field.value ? field.value : '')
-          value = value.length > 1024 ? value.slice(0, 1020) + '...' : value.length > 0 ? value : '\u200b'
+          let value = convert(field.value)
+          if (value.length > 1024) {
+            value = value.slice(0, 1020) + '...'
+          } else if (field.value && !value) {
+            // If a placeholder is empty
+            value = '\u200b'
+          }
 
-          if (typeof title === 'string' && !title) {
-            richEmbed.addBlankField(inline)
-          } else if (richEmbed.fields.length < 10) {
-            richEmbed.addField(title, value, inline)
+          if (richEmbed.fields.length < 10) {
+            richEmbed.addField(name, value, inline)
           }
         }
       }
@@ -170,143 +188,218 @@ class ArticleMessage {
     return richEmbeds
   }
 
-  async _resolveWebhook () {
-    const { channel, source } = this
-    if (typeof source.webhook !== 'object' || !channel.guild.me.permissionsIn(channel).has('MANAGE_WEBHOOKS')) return
-    try {
-      const hooks = await channel.fetchWebhooks()
-      const hook = hooks.get(source.webhook.id)
-      if (!hook) return
-      const guildId = channel.guild.id
-      const guildName = channel.guild.name
-      this.webhook = hook
-      this.webhook.guild = { id: guildId, name: guildName }
-      let name = source.webhook.name ? this.parsedArticle.convertKeywords(source.webhook.name) : undefined
-      if (name && name.length > 32) name = name.slice(0, 29) + '...'
-      if (name && name.length < 2) name = undefined
-      this.webhook.name = name
-      this.webhook.avatar = source.webhook.avatar ? this.parsedArticle.convertImgs(source.webhook.avatar) : undefined
-    } catch (err) {
-      log.general.warning(`Cannot fetch webhooks for ArticleMessage webhook initialization to send message`, channel, err, true)
-    }
-  }
-
-  _generateMessage (ignoreLimits = !!this.source.splitMessage) {
-    const { parsedArticle } = this
-    const { textFormat, embedFormat } = this._determineFormat()
-
-    // Determine what the text is, based on whether an embed exists
-    if (Array.isArray(embedFormat) && embedFormat.length > 0) {
-      const embeds = this._convertEmbeds(embedFormat)
-      const text = textFormat === '{empty}' ? '' : parsedArticle.convertKeywords(textFormat, ignoreLimits)
-      return { embeds, text }
-    } else {
-      const text = parsedArticle.convertKeywords(textFormat === '{empty}' ? config.feeds.defaultMessage : textFormat, ignoreLimits)
-      return { text }
-    }
-  }
-
-  _generateTestMessage () {
-    const { parsedArticle, filterResults } = this
-    let testDetails = ''
-    const footer = '\nBelow is the configured message to be sent for this feed:\n\n--'
-    testDetails += `\`\`\`Markdown\n# BEGIN TEST DETAILS #\`\`\`\`\`\`Markdown`
-
-    if (parsedArticle.title) {
-      testDetails += `\n\n[Title]: {title}\n${parsedArticle.title}`
-    }
-
-    if (parsedArticle.summary && parsedArticle.summary !== parsedArticle.description) { // Do not add summary if summary === description
-      let testSummary
-      if (parsedArticle.description && parsedArticle.description.length > 500) {
-        testSummary = (parsedArticle.summary.length > 500) ? `${parsedArticle.summary.slice(0, 490)} [...]\n\n**(Truncated summary for shorter rsstest)**` : parsedArticle.summary // If description is long, truncate summary.
-      } else {
-        testSummary = parsedArticle.summary
-      }
-      testDetails += `\n\n[Summary]: {summary}\n${testSummary}`
-    }
-
-    if (parsedArticle.description) {
-      let testDescrip
-      if (parsedArticle.summary && parsedArticle.summary.length > 500) {
-        testDescrip = (parsedArticle.description.length > 500) ? `${parsedArticle.description.slice(0, 490)} [...]\n\n**(Truncated description for shorter rsstest)**` : parsedArticle.description // If summary is long, truncate description.
-      } else {
-        testDescrip = parsedArticle.description
-      }
-      testDetails += `\n\n[Description]: {description}\n${testDescrip}`
-    }
-
-    if (parsedArticle.date) testDetails += `\n\n[Published Date]: {date}\n${parsedArticle.date}`
-    if (parsedArticle.author) testDetails += `\n\n[Author]: {author}\n${parsedArticle.author}`
-    if (parsedArticle.link) testDetails += `\n\n[Link]: {link}\n${parsedArticle.link}`
-    if (parsedArticle.subscriptions) testDetails += `\n\n[Subscriptions]: {subscriptions}\n${parsedArticle.subscriptions.split(' ').length - 1} subscriber(s)`
-    if (parsedArticle.images) testDetails += `\n\n${parsedArticle.listImages()}`
-    const placeholderImgs = parsedArticle.listPlaceholderImages()
-    if (placeholderImgs) testDetails += `\n\n${placeholderImgs}`
-    const placeholderAnchors = parsedArticle.listPlaceholderAnchors()
-    if (placeholderAnchors) testDetails += `\n\n${placeholderAnchors}`
-    if (parsedArticle.tags) testDetails += `\n\n[Tags]: {tags}\n${parsedArticle.tags}`
-    if (this.source.filters) testDetails += `\n\n[Passed Filters?]: ${this.passedFilters ? 'Yes' : 'No'}${this.passedFilters ? filterResults.listMatches(false) + filterResults.listMatches(true) : filterResults.listMatches(true) + filterResults.listMatches(false)}`
-    testDetails += '```' + footer
-
-    return testDetails
-  }
-
-  _createSendOptions () {
-    const text = this.isTestMessage ? this.testDetails : this.text.length > 1950 && !this.split ? `Error: Feed Article could not be sent for ${this.article.link} due to a single message's character count >1950.` : this.text.length === 0 && !this.embeds ? `Unable to send empty message for feed article <${this.article.link}> (${this.rssName}).` : this.text
-    const options = this.isTestMessage ? ArticleMessage.TEST_OPTIONS : {}
-    if (this.webhook) {
-      options.username = this.webhook.name
-      options.avatarURL = this.webhook.avatar
-    }
-    if (!this.isTestMessage && this.embeds) {
-      if (this.webhook) options.embeds = this.embeds
-      else options.embed = this.embeds[0]
-    }
-    if (!this.isTestMessage) options.split = this.split
-    return { text, options }
-  }
-
-  async send () {
-    if (!this.source) throw new Error('Missing feed source')
-    if (!this.channel) throw new Error('Missing feed channel')
-    await this._resolveWebhook()
-    if (!this.passedFilters) {
-      if (config.log.unfiltered === true) log.general.info(`'${this.article.link ? this.article.link : this.article.title}' did not pass filters and was not sent`, this.channel)
+  /**
+   * @param {import('discord.js').Client} bot
+   */
+  async getWebhook (bot) {
+    const { feed } = this
+    const channel = this.getChannel(bot)
+    if (!channel) {
       return
     }
-    if (deletedFeeds.includes(this.rssName)) throw new Error(`${this.rssName} for channel ${this.channel.id} was deleted during cycle`)
-
-    const { text, options } = this._createSendOptions()
-
-    // Send the message, and repeat attempt if failed
-    const medium = this.webhook ? this.webhook : this.channel
+    const permission = Discord.Permissions.FLAGS.MANAGE_WEBHOOKS
+    if (!feed.webhook || !channel.guild.me.permissionsIn(channel).has(permission)) {
+      return
+    }
+    if (feed.webhook.disabled) {
+      return
+    }
     try {
-      const m = await medium.send(text, options)
-      if (this.isTestMessage) {
-        this.isTestMessage = false
-        return this.send()
-      } else {
-        return m
+      const hooks = await channel.fetchWebhooks()
+      const hook = hooks.get(feed.webhook.id)
+      if (!hook) {
+        return
       }
+      return hook
     } catch (err) {
-      if (err.code === 50013 || this.sendFailed++ === 4) { // 50013 = Missing Permissions
-        if (debugFeeds.includes(this.rssName)) log.debug.error(`${this.rssName}: Message has been translated but could not be sent (TITLE: ${this.article.title})`, err)
+      const log = createLogger(bot.shard.ids[0])
+      log.warn({
+        channel,
+        error: err
+      }, 'Cannot fetch webhooks for ArticleMessage webhook initialization to send message')
+    }
+  }
+
+  /**
+   * @param {import('discord.js').Webhook} [webhook]
+   */
+  getWebhookNameAvatar (webhook) {
+    const { feed, parsedArticle } = this
+    const options = {
+      username: webhook.name,
+      avatarURL: webhook.avatarURL()
+    }
+    if (feed.webhook.name) {
+      options.username = parsedArticle.convertKeywords(feed.webhook.name).slice(0, 32)
+    }
+    if (feed.webhook.avatar) {
+      options.avatarURL = parsedArticle.convertImgs(feed.webhook.avatar)
+    }
+    return options
+  }
+
+  generateMessage (ignoreLimits = !!this.feed.split) {
+    const { parsedArticle } = this
+    const { text, embeds } = this.determineFormat()
+
+    // Determine what the text/embeds are, based on whether an embed exists
+    let useEmbeds = embeds
+    let useText = text
+    if (embeds.length > 0) {
+      useEmbeds = this.convertEmbeds(embeds)
+      let convert = text
+      if (text === '{empty}') {
+        convert = ''
+      }
+      useText = parsedArticle.convertKeywords(convert, ignoreLimits)
+    } else {
+      let convert = text
+      if (text === '{empty}') {
+        convert = this.config.feeds.defaultText
+      }
+      useText = parsedArticle.convertKeywords(convert, ignoreLimits)
+    }
+    if (useText.length > 1950 && !ignoreLimits) {
+      useText = `Error: Feed Article could not be sent for ${this.article.link} due to a single message's character count >1950.`
+    }
+    if (useText.length === 0 && embeds.length === 0) {
+      useText = `Unable to send empty message for feed article <${this.article.link}> (${this.feed._id}).`
+    }
+    return {
+      embeds: useEmbeds,
+      text: useText
+    }
+  }
+
+  createOptions (embeds, medium) {
+    const isWebhook = medium instanceof Discord.Webhook
+    const options = {
+      allowedMentions: {
+        parse: ['roles', 'users', 'everyone']
+      }
+    }
+    if (isWebhook) {
+      options.embeds = embeds
+      const webhookSettings = this.getWebhookNameAvatar(medium)
+      options.username = webhookSettings.username
+      options.avatarURL = webhookSettings.avatarURL
+    } else {
+      options.embed = embeds[0]
+    }
+    options.split = this.feed.split
+    return options
+  }
+
+  /**
+   * Create an API payload meant for use with the delivery microservice
+   */
+  createAPIPayload (medium) {
+    const { text, embeds } = this.generateMessage()
+    const options = this.createOptions(embeds, medium)
+    // First convert camel case properties to snake case
+    const transformed = {
+      ...options,
+      allowed_mentions: options.allowedMentions
+    }
+    delete transformed.allowedMentions
+    if (transformed.avatarURL) {
+      transformed.avatar_url = options.avatarURL
+      delete transformed.avatarURL
+    }
+    return {
+      ...transformed,
+      content: text
+    }
+  }
+
+  /**
+   * Create multiple API payloads from one payload if its text content
+   * exceeds 2000 characters
+   */
+  createAPIPayloads (medium) {
+    const apiPayload = this.createAPIPayload(medium)
+    const text = apiPayload.content
+    if (!apiPayload.split || text.length < 2000) {
+      return [apiPayload]
+    }
+    // Each string in parts should not exceed 2000 characters
+    let textParts = [text]
+    if (apiPayload.split) {
+      textParts = Discord.Util.splitMessage(text)
+    }
+    const isWebhook = medium instanceof Discord.Webhook
+    const payloadParts = []
+    for (let i = 0; i < textParts.length; ++i) {
+      const thisApiPayload = {
+        ...apiPayload,
+        content: textParts[i]
+      }
+      // Delete the embed fields for a clean slate
+      delete thisApiPayload.embed
+      delete thisApiPayload.embeds
+      const isLastElement = i === textParts.length - 1
+      // Channel messages use a "embed" object field and cannot have multiple embeds
+      const channelEmbed = isWebhook || !isLastElement || !apiPayload.embed ? undefined : apiPayload.embed
+      // Webhook messages uses a "embeds" array field and can have multiple embeds
+      const webhookEmbeds = !isWebhook || !isLastElement ? undefined : apiPayload.embeds
+      if (channelEmbed) {
+        thisApiPayload.embed = channelEmbed
+      } else if (webhookEmbeds) {
+        thisApiPayload.embeds = webhookEmbeds
+      }
+      payloadParts.push(thisApiPayload)
+    }
+    return payloadParts
+  }
+
+  createTextAndOptions (medium) {
+    const { text, embeds } = this.generateMessage()
+    const options = this.createOptions(embeds, medium)
+    return {
+      text,
+      options
+    }
+  }
+
+  /**
+   * @param {import('discord.js').Client} bot
+   */
+  async getMedium (bot) {
+    const webhook = await this.getWebhook(bot)
+    if (webhook) {
+      return webhook
+    }
+    const channel = this.getChannel(bot)
+    return channel
+  }
+
+  /**
+   * @param {import('discord.js').Client} bot
+   */
+  async send (bot) {
+    if (devLevels.disableOutgoingMessages()) {
+      return
+    }
+    const medium = await this.getMedium(bot)
+    if (!medium) {
+      throw new Error('Missing medium to send message to')
+    }
+    const { text, options } = this.createTextAndOptions(medium)
+    // Send the message, and repeat attempt if failed
+    try {
+      return await medium.send(text, options)
+    } catch (err) {
+      // 50013 = Missing Permissions, 50035 = Invalid form
+      if (err.code === 50013 || err.code === 50035 || this.sendFailed++ === 3) {
+        if (this.debug) {
+          const log = createLogger(bot.shard.ids[0])
+          log.info({
+            error: err
+          }, `${this.feed._id}: Message has been translated but could not be sent (TITLE: ${this.article.title})`)
+        }
         throw err
       }
-      if (this.split) {
-        const tooLong = err.message.includes('2000 or fewer in length')
-        const noSplitChar = err.message.includes('no split characters')
-        if (tooLong) {
-          delete this.split
-        }
-        if (tooLong || noSplitChar) {
-          const messageWithCharacterLimits = this._generateMessage(false) // Regenerate with the character limits for individual placeholders again
-          this.embeds = messageWithCharacterLimits.embeds
-          this.text = messageWithCharacterLimits.text
-        }
-      }
-      return this.send()
+      return this.send(bot, medium)
     }
   }
 }

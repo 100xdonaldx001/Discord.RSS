@@ -1,14 +1,14 @@
-const config = require('../config.js')
 const moment = require('moment-timezone')
 const htmlConvert = require('html-to-text')
 const htmlDecoder = require('html-to-text/lib/formatter.js').text
 const FlattenedJSON = require('./FlattenedJSON.js')
-const testFilters = require('../rss/translator/filters.js')
-const defaultConfigs = require('../util/checkConfig.js').defaultConfigs
+const FilterResults = require('./FilterResults.js')
+const Filter = require('./Filter.js')
+const FilterRegex = require('./FilterRegex.js')
+const getConfig = require('../config.js').get
 const VALID_PH_IMGS = ['title', 'description', 'summary']
 const VALID_PH_ANCHORS = ['title', 'description', 'summary']
 const BASE_REGEX_PHS = ['title', 'author', 'summary', 'description', 'guid', 'date', 'link']
-const RAW_REGEX_FINDER = new RegExp('{raw:([^{}]+)}', 'g')
 
 function dateHasNoTime (date) { // Determine if the time is T00:00:00.000Z
   const timeParts = [date.getUTCHours(), date.getMinutes(), date.getSeconds(), date.getMilliseconds()]
@@ -88,17 +88,17 @@ function regexReplace (string, searchOptions, replacement, replacementDirect) {
   return string
 }
 
-function evalRegexConfig (source, text, placeholderName) {
+function evalRegexConfig (feed, text, placeholderName) {
   const customPlaceholders = {}
 
-  if (Array.isArray(source.regexOps[placeholderName])) { // Eval regex if specified
-    if (Array.isArray(source.regexOps.disabled) && source.regexOps.disabled.length > 0) { // .disabled can be an array of disabled placeholders, or just a boolean to disable everything
-      for (var y in source.regexOps.disabled) { // Looping through strings of placeholders
-        if (source.regexOps.disabled[y] === placeholderName) return null
+  if (Array.isArray(feed.regexOps[placeholderName])) { // Eval regex if specified
+    if (Array.isArray(feed.regexOps.disabled) && feed.regexOps.disabled.length > 0) { // .disabled can be an array of disabled placeholders, or just a boolean to disable everything
+      for (var y in feed.regexOps.disabled) { // Looping through strings of placeholders
+        if (feed.regexOps.disabled[y] === placeholderName) return null
       }
     }
 
-    const phRegexOps = source.regexOps[placeholderName]
+    const phRegexOps = feed.regexOps[placeholderName]
     for (var regexOpIndex in phRegexOps) { // Looping through each regexOp for a placeholder
       const regexOp = phRegexOps[regexOpIndex]
       if (regexOp.disabled === true || typeof regexOp.name !== 'string') continue
@@ -111,16 +111,16 @@ function evalRegexConfig (source, text, placeholderName) {
   return customPlaceholders
 }
 
-function cleanup (source, text, imgSrcs, anchorLinks, encoding) {
+function cleanup (feed, text, imgSrcs, anchorLinks) {
   if (!text) return ''
-
+  const config = getConfig()
   text = htmlDecoder({ data: text }, {}).replace(/\*/gi, '')
     .replace(/<(strong|b)>(.*?)<\/(strong|b)>/gi, '**$2**') // Bolded markdown
     .replace(/<(em|i)>(.*?)<(\/(em|i))>/gi, '*$2*') // Italicized markdown
     .replace(/<(u)>(.*?)<(\/(u))>/gi, '__$2__') // Underlined markdown
 
   text = htmlConvert.fromString(text, {
-    tables: (source.formatTables !== undefined && typeof source.formatTables === 'boolean' ? source.formatTables : config.feeds.formatTables) === true ? true : [],
+    tables: (feed.formatTables !== undefined && typeof feed.formatTables === 'boolean' ? feed.formatTables : config.feeds.formatTables) === true ? true : [],
     wordwrap: null,
     ignoreHref: true,
     noLinkBrackets: true,
@@ -136,16 +136,16 @@ function cleanup (source, text, imgSrcs, anchorLinks, encoding) {
         }
 
         let exist = true
-        const globalExistOption = config.feeds.imgLinksExistence != null ? config.feeds.imgLinksExistence : defaultConfigs.feeds.imgLinksExistence.default // Always a boolean via startup checks
+        const globalExistOption = config.feeds.imgLinksExistence
         exist = globalExistOption
-        const specificExistOption = source.imgLinksExistence
+        const specificExistOption = feed.imgLinksExistence
         exist = typeof specificExistOption !== 'boolean' ? exist : specificExistOption
         if (!exist) return ''
 
         let image = ''
-        const globalPreviewOption = config.feeds.imgPreviews != null ? config.feeds.imgPreviews : defaultConfigs.feeds.imgPreviews.default // Always a boolean via startup checks
+        const globalPreviewOption = config.feeds.imgPreviews
         image = globalPreviewOption ? link : `<${link}>`
-        const specificPreviewOption = source.imgPreviews
+        const specificPreviewOption = feed.imgPreviews
         image = typeof specificPreviewOption !== 'boolean' ? image : specificPreviewOption === true ? link : `<${link}>`
 
         return image
@@ -156,6 +156,10 @@ function cleanup (source, text, imgSrcs, anchorLinks, encoding) {
         const href = node.attribs.href ? node.attribs.href.trim() : ''
         if (anchorLinks.length < 5 && href) anchorLinks.push(href)
         return orig
+      },
+      blockquote: (node, fn, options) => {
+        const orig = fn(node.children, options).trim()
+        return '> ' + orig.replace(/(?:\n)/g, '\n> ') + '\n'
       }
     }
   })
@@ -168,21 +172,23 @@ function cleanup (source, text, imgSrcs, anchorLinks, encoding) {
 }
 
 module.exports = class Article {
-  constructor (raw, source) {
+  constructor (raw, feedData) {
+    const feed = feedData.feed
+    const profile = feedData.profile || {}
     this.id = raw._id || null
-    this.source = source
-    this.dateSettings = source.dateSettings
+    this.feed = feed
+    this.profile = profile
     this.raw = raw
-    this.encoding = raw.meta['#xml'].encoding ? raw.meta['#xml'].encoding.toLowerCase() : 'utf-8'
     this.reddit = raw.meta.link && raw.meta.link.includes('www.reddit.com')
     this.youtube = !!(raw.guid && raw.guid.startsWith('yt:video') && raw['media:group'] && raw['media:group']['media:description'] && raw['media:group']['media:description']['#'])
-    this.enabledRegex = typeof source.regexOps === 'object' && source.regexOps.disabled !== true
+    this.enabledRegex = typeof feed.regexOps === 'object' && feed.regexOps.disabled !== true
     this.placeholdersForRegex = BASE_REGEX_PHS.slice()
+    this.privatePlaceholders = ['id', 'fullDescription', 'fullSummary', 'fullTitle', 'fullDate']
     this.placeholders = []
     this.meta = raw.meta
     this.guid = raw.guid
     // Author
-    this.author = raw.author ? cleanup(source, raw.author, undefined, undefined, this.encoding) : ''
+    this.author = raw.author ? cleanup(feed, raw.author) : ''
     if (this.author) this.placeholders.push('author')
 
     // Link
@@ -193,8 +199,8 @@ module.exports = class Article {
     // Title
     this.titleImages = []
     this.titleAnchors = []
-    this._fullTitle = cleanup(source, raw.title, this.titleImages, this.titleAnchors, this.encoding)
-    this.title = this._fullTitle.length > 150 ? `${this._fullTitle.slice(0, 150)}...` : this._fullTitle
+    this.fullTitle = cleanup(feed, raw.title, this.titleImages, this.titleAnchors)
+    this.title = this.fullTitle.length > 150 ? `${this.fullTitle.slice(0, 150)}...` : this.fullTitle
     if (this.title) this.placeholders.push('title')
     for (var titleImgNum in this.titleImages) {
       const term = `title:image${parseInt(titleImgNum, 10) + 1}`
@@ -214,15 +220,15 @@ module.exports = class Article {
     if (this.guid) this.placeholders.push('guid')
 
     // Date
-    this._fullDate = raw.pubdate
-    this.date = this.formatDate(this._fullDate, this.dateSettings.timezone)
+    this.fullDate = raw.pubdate
+    this.date = this.formatDate(this.fullDate, this.profile.timezone)
     if (this.date) this.placeholders.push('date')
 
     // Description and reddit-specific placeholders
     this.descriptionImages = []
     this.descriptionAnchors = []
-    this._fullDescription = this.youtube ? raw['media:group']['media:description']['#'] : cleanup(source, raw.description, this.descriptionImages, this.descriptionAnchors, this.encoding) // Account for youtube's description
-    this.description = this._fullDescription
+    this.fullDescription = this.youtube ? raw['media:group']['media:description']['#'] : cleanup(feed, raw.description, this.descriptionImages, this.descriptionAnchors) // Account for youtube's description
+    this.description = this.fullDescription
     this.description = this.description.length > 800 ? `${this.description.slice(0, 790)}...` : this.description
     if (this.description) this.placeholders.push('description')
     for (var desImgNum in this.descriptionImages) {
@@ -240,15 +246,15 @@ module.exports = class Article {
 
     if (this.reddit) {
       // Truncate the useless end of reddit description after anchors are removed
-      this._fullDescription = this._fullDescription.replace('\n[link] [comments]', '')
+      this.fullDescription = this.fullDescription.replace('\n[link] [comments]', '')
       this.description = this.description.replace('\n[link] [comments]', '')
     }
 
     // Summary
     this.summaryImages = []
     this.summaryAnchors = []
-    this._fullSummary = cleanup(source, raw.summary, this.summaryImages, this.summaryAnchors, this.encoding)
-    this.summary = this._fullSummary.length > 800 ? `${this._fullSummary.slice(0, 790)}...` : this._fullSummary
+    this.fullSummary = cleanup(feed, raw.summary, this.summaryImages, this.summaryAnchors)
+    this.summary = this.fullSummary.length > 800 ? `${this.fullSummary.slice(0, 790)}...` : this.fullSummary
     if (this.summary && raw.summary !== raw.description) this.placeholders.push('summary')
     for (var sumImgNum in this.summaryImages) {
       const term = `summary:image${+sumImgNum + 1}`
@@ -287,7 +293,7 @@ module.exports = class Article {
         categoryList += cats[category].trim()
         if (parseInt(category, 10) !== cats.length - 1) categoryList += '\n'
       }
-      this.tags = cleanup(source, categoryList, undefined, undefined, this.encoding)
+      this.tags = cleanup(feed, categoryList)
       if (this.tags) this.placeholders.push('tags')
     }
 
@@ -296,28 +302,35 @@ module.exports = class Article {
       this.regexPlaceholders = {} // Each key is a validRegexPlaceholder, and their values are an object of named placeholders with the modified content
       for (var b in this.placeholdersForRegex) {
         const placeholderName = this.placeholdersForRegex[b]
-        const regexResults = evalRegexConfig(source, this[placeholderName], placeholderName)
+        const regexResults = evalRegexConfig(feed, this[placeholderName], placeholderName)
         this.regexPlaceholders[placeholderName] = regexResults
       }
     }
 
     // Finally subscriptions - this MUST be done last after all variables have been defined for filter testing
-    this.subscriptions = ''
-    this.subscriptionIds = [] // Used for role mention toggling
+    this.subscribers = ''
 
     // Get filtered subscriptions
-    const subscribers = source.subscribers
+    const subscribers = feedData.subscribers
     if (subscribers) {
       for (const subscriber of subscribers) {
         const type = subscriber.type
-        if (type !== 'role' && type !== 'user') continue
+        if (type !== 'role' && type !== 'user') {
+          continue
+        }
         const mentionText = type === 'role' ? `<@&${subscriber.id}> ` : `<@${subscriber.id}> `
-        if (subscriber.filters && testFilters(subscriber.filters, this).passed) this.subscriptions += mentionText
-        else if (!subscriber.filters || Object.keys(subscriber.filters).length === 0) this.subscriptions += mentionText
-        if (type === 'role') this.subscriptionIds.push(subscriber.id) // For ArticleMessage mention toggling
+        if (subscriber.filters && this.testFilters(subscriber.filters).passed) {
+          this.subscribers += mentionText
+        } else if (!subscriber.filters || Object.keys(subscriber.filters).length === 0) {
+          this.subscribers += mentionText
+        }
       }
     }
-    if (this.subscriptions) this.placeholders.push('subscriptions')
+
+    if (this.subscribers) {
+      this.placeholders.push('subscriptions')
+      this.placeholders.push('subscribers')
+    }
   }
 
   // List all {imageX} to string
@@ -449,31 +462,35 @@ module.exports = class Article {
   convertRawPlaceholders (content) {
     let result
     const matches = {}
+    const config = getConfig()
+    const regex = new RegExp('{raw:([^{}]+)}', 'g')
     do {
-      result = RAW_REGEX_FINDER.exec(content)
+      result = regex.exec(content)
       if (!result) continue
-      if (!this.flattenedJSON) this.flattenedJSON = new FlattenedJSON(this.raw, this.source, this.encoding)
+      if (!this.flattenedJSON) this.flattenedJSON = new FlattenedJSON(this.raw, this.feed)
       const fullMatch = result[0]
       const matchName = result[1]
       matches[fullMatch] = this.flattenedJSON.results[matchName] || ''
 
       // Format the date if it is one
       if (Object.prototype.toString.call(matches[fullMatch]) === '[object Date]') {
-        const guildTimezone = this.dateSettings.timezone
+        const guildTimezone = this.profile.timezone
         const timezone = guildTimezone && moment.tz.zone(guildTimezone) ? guildTimezone : config.feeds.timezone
-        const dateFormat = this.dateSettings.format ? this.dateSettings.format : config.feeds.dateFormat
+        const dateFormat = this.profile.dateFormat ? this.profile.dateFormat : config.feeds.dateFormat
         const localMoment = moment(matches[fullMatch])
-        if (this.dateSettings.language) localMoment.locale(this.dateSettings.language)
+        if (this.profile.dateLanguage) localMoment.locale(this.profile.dateLanguage)
         const useTimeFallback = config.feeds.timeFallback === true && matches[fullMatch].toString() !== 'Invalid Date' && dateHasNoTime(matches[fullMatch])
         matches[fullMatch] = useTimeFallback ? setCurrentTime(localMoment).tz(timezone).format(dateFormat) : localMoment.tz(timezone).format(dateFormat)
       }
     } while (result !== null)
-    for (var phName in matches) content = content.replace(phName, matches[phName])
+    for (var phName in matches) {
+      content = content.replace(new RegExp(escapeRegExp(phName), 'g'), matches[phName])
+    }
     return content
   }
 
   getRawPlaceholders () {
-    if (!this.flattenedJSON) this.flattenedJSON = new FlattenedJSON(this.raw, this.source, this.encoding)
+    if (!this.flattenedJSON) this.flattenedJSON = new FlattenedJSON(this.raw, this.feed)
     return this.flattenedJSON.results
   }
 
@@ -481,22 +498,23 @@ module.exports = class Article {
     if (!phName.startsWith('raw:')) return ''
     if (this.flattenedJSON) return this.flattenedJSON.results[phName.replace(/raw:/, '')] || ''
     else {
-      this.flattenedJSON = new FlattenedJSON(this.raw, this.source, this.encoding)
+      this.flattenedJSON = new FlattenedJSON(this.raw, this.feed)
       return this.flattenedJSON.results[phName.replace(/raw:/, '')] || ''
     }
   }
 
   formatDate (date, tz) {
+    const config = getConfig()
     if (date && date.toString() !== 'Invalid Date') {
       const timezone = tz && moment.tz.zone(tz) ? tz : config.feeds.timezone
-      const dateFormat = this.dateSettings.format ? this.dateSettings.format : config.feeds.dateFormat
+      const dateFormat = this.profile.dateFormat ? this.profile.dateFormat : config.feeds.dateFormat
 
       const useDateFallback = config.feeds.dateFallback === true && (!date || date.toString() === 'Invalid Date')
       const useTimeFallback = config.feeds.timeFallback === true && date.toString() !== 'Invalid Date' && dateHasNoTime(date)
       const useDate = useDateFallback ? new Date() : date
       const localMoment = moment(useDate)
-      if (this.dateSettings.language) {
-        localMoment.locale(this.dateSettings.language)
+      if (this.profile.dateLanguage) {
+        localMoment.locale(this.profile.dateLanguage)
       }
       const vanityDate = useTimeFallback ? setCurrentTime(localMoment).tz(timezone).format(dateFormat) : localMoment.tz(timezone).format(dateFormat)
       return vanityDate === 'Invalid Date' ? '' : vanityDate
@@ -504,17 +522,185 @@ module.exports = class Article {
     return ''
   }
 
+  createTestText () {
+    const filterResults = this.testFilters(this.feed.filters)
+    let testDetails = ''
+    const footer = `\nBelow is the configured message to be sent for this feed in the channel <#${this.feed.channel}>:\n\n--`
+    testDetails += '```Markdown\n# BEGIN TEST DETAILS #``````Markdown'
+
+    if (this.title) {
+      testDetails += `\n\n[Title]: {title}\n${this.title}`
+    }
+
+    // Do not add summary if summary === description
+    if (this.summary && this.summary !== this.description) {
+      let testSummary
+      if (this.description && this.description.length > 500) {
+        // If description is long, truncate summary.
+        testSummary = (this.summary.length > 500) ? `${this.summary.slice(0, 490)} [...]\n\n**(Truncated summary for shorter rsstest)**` : this.summary
+      } else {
+        testSummary = this.summary
+      }
+      testDetails += `\n\n[Summary]: {summary}\n${testSummary}`
+    }
+
+    if (this.description) {
+      let testDescrip
+      if (this.summary && this.summary.length > 500) {
+        // If summary is long, truncate description.
+        testDescrip = (this.description.length > 500) ? `${this.description.slice(0, 490)} [...]\n\n**(Truncated description for shorter rsstest)**` : this.description
+      } else {
+        testDescrip = this.description
+      }
+      testDetails += `\n\n[Description]: {description}\n${testDescrip}`
+    }
+
+    if (this.date) testDetails += `\n\n[Published Date]: {date}\n${this.date}`
+    if (this.author) testDetails += `\n\n[Author]: {author}\n${this.author}`
+    if (this.link) testDetails += `\n\n[Link]: {link}\n${this.link}`
+    if (this.subscribers) testDetails += `\n\n[Subscribers]: {subscribers}\n${this.subscribers.split(' ').length - 1} subscriber(s)`
+    if (this.images) testDetails += `\n\n${this.listImages()}`
+    const placeholderImgs = this.listPlaceholderImages()
+    if (placeholderImgs) testDetails += `\n\n${placeholderImgs}`
+    const placeholderAnchors = this.listPlaceholderAnchors()
+    if (placeholderAnchors) testDetails += `\n\n${placeholderAnchors}`
+    if (this.tags) testDetails += `\n\n[Tags]: {tags}\n${this.tags}`
+    if (this.feed.filters) {
+      testDetails += `\n\n[Passed Filters?]: ${filterResults.passed ? 'Yes' : 'No'}${filterResults.passed ? filterResults.listMatches(false) + filterResults.listMatches(true) : filterResults.listMatches(true) + filterResults.listMatches(false)}`
+    }
+    testDetails += '```' + footer
+
+    return testDetails
+  }
+
+  /**
+   * @param {string[]} userFilters
+   * @param {string} reference
+   */
+  testArrayFilters (userFilters, reference) {
+    // Deal with inverted first
+    const filters = userFilters.map(word => new Filter(word))
+    const invertedFilters = filters.filter(filter => filter.inverted)
+    const regularFilters = filters.filter(filter => !filter.inverted)
+    const blocked = invertedFilters.find(filter => !filter.passes(reference))
+    const returnData = {
+      inverted: invertedFilters.map(f => f.content),
+      regular: regularFilters.map(f => f.content)
+    }
+    if (blocked) {
+      return {
+        ...returnData,
+        passed: false
+      }
+    }
+
+    if (regularFilters.length === 0) {
+      return {
+        ...returnData,
+        passed: true
+      }
+    }
+    const passed = !!regularFilters.find(filter => filter.passes(reference))
+    return {
+      ...returnData,
+      passed
+    }
+  }
+
+  /**
+   * @param {string} userFilter
+   * @param {string} reference
+   */
+  testRegexFilter (userFilter, reference) {
+    const filter = new FilterRegex(userFilter)
+    const filterPassed = filter.passes(reference)
+    if (filterPassed) {
+      return {
+        inverted: [],
+        regular: [userFilter],
+        passed: true
+      }
+    } else {
+      return {
+        inverted: [userFilter],
+        regular: [],
+        passed: false
+      }
+    }
+  }
+
+  getFilterReference (type) {
+    const referenceOverrides = {
+      description: this.fullDescription,
+      summary: this.fullSummary,
+      title: this.fullTitle
+    }
+    if (type.startsWith('raw:')) {
+      return this.getRawPlaceholderContent(type)
+    } else {
+      return referenceOverrides[type.replace('other:', '')] || this[type.replace('other:', '')]
+    }
+  }
+
+  testFilters (filters) {
+    const filterResults = new FilterResults()
+    if (Object.keys(filters).length === 0) {
+      filterResults.passed = true
+      return filterResults
+    }
+    const everyReferenceExists = Object.keys(filters).every(type => !!this.getFilterReference(type))
+    filterResults.passed = everyReferenceExists
+    // If not every key in filters exists on the articles, auto-block it
+    if (!everyReferenceExists) {
+      return filterResults
+    }
+    let passed = false
+    let hasOneBlock = false
+    for (const filterTypeName in filters) {
+      const userFilters = filters[filterTypeName]
+      const reference = this.getFilterReference(filterTypeName)
+      if (!reference) {
+        continue
+      }
+      let invertedFilters = []
+      let regularFilters = []
+
+      // Filters can either be an array of words or a string (regex)
+      let results
+      if (Array.isArray(userFilters)) {
+        results = this.testArrayFilters(userFilters, reference)
+      } else {
+        results = this.testRegexFilter(userFilters, reference)
+      }
+      passed = results.passed || passed
+      invertedFilters = invertedFilters.concat(results.inverted)
+      regularFilters = regularFilters.concat(results.regular)
+      if (regularFilters.length > 0) {
+        filterResults.add(filterTypeName, regularFilters, false)
+      }
+      if (invertedFilters.length > 0) {
+        filterResults.add(filterTypeName, invertedFilters, true)
+        if (!results.passed) {
+          hasOneBlock = true
+        }
+      }
+    }
+    filterResults.passed = hasOneBlock ? false : passed
+    return filterResults
+  }
+
   // replace simple keywords
   convertKeywords (word = '', ignoreCharLimits) {
     if (word.length === 0) return word
-    let content = word.replace(/{title}/g, ignoreCharLimits ? this._fullTitle : this.title)
+    let content = word.replace(/{title}/g, ignoreCharLimits ? this.fullTitle : this.title)
       .replace(/{author}/g, this.author)
-      .replace(/{summary}/g, ignoreCharLimits ? this._fullSummary : this.summary)
-      .replace(/{subscriptions}/g, this.subscriptions)
+      .replace(/{summary}/g, ignoreCharLimits ? this.fullSummary : this.summary)
+      .replace(/({subscriptions})|({subscribers})/g, this.subscribers)
       .replace(/{link}/g, this.link)
-      .replace(/{description}/g, ignoreCharLimits ? this._fullDescription : this.description)
+      .replace(/{description}/g, ignoreCharLimits ? this.fullDescription : this.description)
       .replace(/{tags}/g, this.tags)
       .replace(/{guid}/g, this.guid)
+      .replace(/\\u200b/g, '\u200b')
 
     const dateRegex = new RegExp('{date(:[a-zA-Z_/]*)?}')
 
@@ -527,7 +713,7 @@ module.exports = class Article {
         // no custom timezone was defined after date within the placeholder
         convertedDate = this.date
       } else if (moment.tz.zone(zone)) {
-        convertedDate = this.formatDate(this._fullDate, zone)
+        convertedDate = this.formatDate(this.fullDate, zone)
       }
 
       content = content.substring(0, result.index) + convertedDate + content.substring(result.index + fullLength, content.length)
@@ -544,5 +730,34 @@ module.exports = class Article {
     }
 
     return this.convertRawPlaceholders(this.convertAnchors(this.convertImgs(content)))
+  }
+
+  toJSON () {
+    const data = {}
+    // Regular
+    for (const placeholder of this.placeholders) {
+      data[placeholder] = this[placeholder]
+    }
+
+    // Private
+    for (const placeholder of this.privatePlaceholders) {
+      data[`_${placeholder}`] = this[placeholder]
+    }
+
+    // Regex
+    for (const placeholder in this.regexPlaceholders) {
+      const value = this.regexPlaceholders[placeholder]
+      for (const customName in value) {
+        data[`regex:${placeholder}:${customName}`] = value[customName]
+      }
+    }
+
+    // Raw
+    const rawPlaceholders = this.getRawPlaceholders()
+    for (const rawPlaceholder in rawPlaceholders) {
+      data[`raw:${rawPlaceholder}`] = rawPlaceholders[rawPlaceholder]
+    }
+
+    return data
   }
 }

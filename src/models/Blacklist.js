@@ -1,17 +1,19 @@
 const mongoose = require('mongoose')
+const Version = require('./common/Version.js')
 
-const schema = mongoose.Schema({
-  isGuild: Boolean,
-  id: {
-    type: String,
-    unique: true
+const schema = new mongoose.Schema({
+  _id: {
+    type: String
   },
-  name: String,
-  date: {
-    type: Date,
-    default: Date.now
-  }
+  type: {
+    type: Number,
+    required: true
+  },
+  name: String
 })
 
+schema.add(Version)
+
 exports.schema = schema
-exports.model = () => mongoose.model('blacklists', schema)
+/** @type {import('mongoose').Model} */
+exports.Model = null

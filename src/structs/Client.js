@@ -1,283 +1,352 @@
-process.env.DRSS = true
 const Discord = require('discord.js')
-const listeners = require('../util/listeners.js')
-const initialize = require('../util/initialization.js')
-const config = require('../config.js')
-const ScheduleManager = require('./ScheduleManager.js')
-const storage = require('../util/storage.js')
-const log = require('../util/logger.js')
-const dbOpsBlacklists = require('../util/db/blacklists.js')
-const dbOpsFailedLinks = require('../util/db/failedLinks.js')
-const dbOpsGeneral = require('../util/db/general.js')
-const dbOpsVips = require('../util/db/vips.js')
-const redisIndex = require('../structs/db/Redis/index.js')
-const connectDb = require('../rss/db/connect.js')
-const ClientManager = require('./ClientManager.js')
 const EventEmitter = require('events')
-const DISABLED_EVENTS = ['TYPING_START', 'MESSAGE_DELETE', 'MESSAGE_UPDATE', 'PRESENCE_UPDATE', 'VOICE_STATE_UPDATE', 'VOICE_SERVER_UPDATE', 'USER_NOTE_UPDATE', 'CHANNEL_PINS_UPDATE']
-const CLIENT_OPTIONS = { disabledEvents: DISABLED_EVENTS, messageCacheMaxSize: 100 }
+const listeners = require('../util/listeners.js')
+const maintenance = require('../maintenance/index.js')
+const ipc = require('../util/ipc.js')
+const Profile = require('./db/Profile.js')
+const initialize = require('../initialization/index.js')
+const getConfig = require('../config.js').get
+const createLogger = require('../util/logger/create.js')
+const connectDb = require('../util/connectDatabase.js')
+const { once } = require('events')
+const devLevels = require('../util/devLevels.js')
+const dumpHeap = require('../util/dumpHeap.js')
+const DeliveryPipeline = require('./DeliveryPipeline.js')
+const RateLimitCounter = require('./RateLimitHitCounter.js')
+
 const STATES = {
   STOPPED: 'STOPPED',
   STARTING: 'STARTING',
-  READY: 'READY'
+  READY: 'READY',
+  EXITING: 'EXITING'
 }
-let webClient
+/**
+ * @type {import('discord.js').ClientOptions}
+ */
+const CLIENT_OPTIONS = {
+  /**
+   * Allow minimal caching for message reactions/pagination
+   * handling. After 10 messages after the initial
+   * paginated embed, the pagination will stop working
+   */
+  messageCacheMaxSize: 10,
+  ws: {
+    intents: [
+      'GUILDS',
+      'GUILD_MESSAGES',
+      'GUILD_MESSAGE_REACTIONS'
+    ]
+  }
+}
 
 class Client extends EventEmitter {
-  constructor (settings, customSchedules) {
+  constructor () {
     super()
-    if (settings.config) {
-      config._overrideWith(settings.config)
-    }
-    if (config.web.enabled === true) {
-      webClient = require('../web/index.js')
-    }
-    if (settings && Array.isArray(settings.suppressLogLevels)) {
-      log.suppressLevel(settings.suppressLogLevels)
-    }
-    if (customSchedules) {
-      if (!Array.isArray(customSchedules)) throw new Error('customSchedules parameter must be an array of objects')
-      else {
-        for (const schedule of customSchedules) {
-          if (schedule.name === 'default') throw new Error('Schedule name cannot be "default"')
-          const keys = Object.keys(schedule)
-          if (!keys.includes('name')) throw new Error('Schedule "name" must be defined')
-          if (!keys.includes('refreshRateMinutes')) throw new Error('Schedule "refreshRateMinutes" must be defined')
-          if (!keys.includes('keywords') && !keys.includes('feedIDs')) throw new Error('Schedule "keywords" or "feedIDs" must be defined')
-        }
-      }
-    }
-    this.scheduleManager = undefined
-    this.setPresence = settings.setPresence
-    this.customSchedules = customSchedules
     this.STATES = STATES
     this.state = STATES.STOPPED
-    this.webClientInstance = undefined
+    /**
+     * @type {import('./DeliveryPipeline.js')}
+     */
+    this.deliveryPipeline = undefined
+    /**
+     * @type {import('pino').Logger}
+     */
+    this.log = createLogger('-')
+    this.rateLimitCounter = new RateLimitCounter()
+    this.rateLimitCounter.on('limitReached', () => {
+      const config = getConfig()
+      if (config.bot.exitOnExcessRateLimits) {
+        this.log.error('Forcing bot to exit due to excess rate limit hits (config.bot.exitOnExcessRateLimits)')
+        this.sendKillMessage()
+      }
+    })
   }
 
   async login (token) {
     if (this.bot) {
-      return log.general.error('Cannot login when already logged in')
+      return this.log.warn('Cannot login when already logged in')
     }
-    if (token instanceof Discord.ShardingManager) {
-      return new ClientManager(token)
+    if (typeof token !== 'string') {
+      throw new TypeError('Argument must a string')
     }
-    const isClient = token instanceof Discord.Client
-    if (!isClient && typeof token !== 'string') {
-      throw new TypeError('Argument must be a Discord.Client, Discord.ShardingManager, or a string')
-    }
-    const client = isClient ? token : new Discord.Client(CLIENT_OPTIONS)
+    const client = new Discord.Client(CLIENT_OPTIONS)
     try {
-      await connectDb()
-      if (!isClient) {
-        await client.login(token)
-      }
-      if (config.web.enabled === true && !this.webClientInstance && (!client.shard || client.shard.count === 0)) {
-        this.webClientInstance = webClient()
-      }
+      await client.login(token)
+      this.deliveryPipeline = await DeliveryPipeline.create(client)
+      this.log = createLogger(client.shard.ids[0].toString())
       this.bot = client
-      this.SHARD_PREFIX = client.shard && client.shard.count > 0 ? `SH ${client.shard.id} ` : ''
-      if (client.shard && client.shard.count > 0) {
-        process.send({ _drss: true, type: 'spawned', shardId: client.shard.id, customSchedules: this.customSchedules && client.shard.id === 0 ? this.customSchedules : undefined })
-      }
-      storage.bot = client
-      if (client.shard && client.shard.count > 0) this.listenToShardedEvents(client)
+      this.shardID = client.shard.ids[0]
+      this.listenToShardedEvents(client)
       if (!client.readyAt) {
-        client.once('ready', this._initialize.bind(this))
+        await once(client, 'ready')
+        this._setup()
       } else {
-        this._initialize()
+        this._setup()
       }
     } catch (err) {
-      if (err.message.includes('too many guilds')) {
-        throw err
-      } else if (!isClient) {
-        log.general.error(`Discord.RSS unable to login, retrying in 10 minutes`, err)
-        setTimeout(() => this.login.bind(this)(token), 600000)
-      }
+      this.log.error(err, 'MonitoRSS failed to start')
+      this.sendKillMessage()
     }
   }
 
-  _initialize () {
+  async connectToDatabase () {
+    const config = getConfig()
+    const mongo = await connectDb(config.database.uri, config.database.connection)
+    mongo.on('error', (error) => {
+      this.log.fatal(error, 'MongoDB connection error')
+      this.sendKillMessage()
+    })
+    mongo.on('disconnected', () => {
+      if (this.state === STATES.EXITING) {
+        return
+      }
+      this.log.error('MongoDB disconnected')
+      if (config.bot.exitOnDatabaseDisconnect) {
+        this.log.info('Stopping processes due to exitOnDatabaseDisconnect')
+        this.sendKillMessage()
+      } else {
+        this.stop()
+      }
+    })
+    mongo.on('reconnected', () => {
+      this.log.info('MongoDB reconnected')
+      this.restart()
+    })
+    return mongo
+  }
+
+  _setup () {
     const bot = this.bot
-    if (this.setPresence === true) {
-      if (config.bot.activityType) bot.user.setActivity(config.bot.activityName, { type: config.bot.activityType, url: config.bot.streamActivityURL || undefined })
-      else bot.user.setActivity(null)
-      bot.user.setStatus(config.bot.status)
-    }
     bot.on('error', err => {
-      log.general.error(`${this.SHARD_PREFIX}Websocket error`, err)
+      this.log.warn('Websocket error', err)
+      const config = getConfig()
       if (config.bot.exitOnSocketIssues === true) {
-        log.general.info('Stopping all processes due to config.bot.exitOnSocketIssues')
-        if (this.scheduleManager) {
-          // Check if it exists first since it may disconnect before it's even initialized
-          for (var sched of this.scheduleManager.scheduleList) sched.killChildren()
+        this.log.info('Stopping all processes due to config.bot.exitOnSocketIssues')
+        this.sendKillMessage()
+      } else {
+        this.stop()
+      }
+    })
+    bot.on('debug', info => {
+      const config = getConfig()
+      if (info.includes('429')) {
+        this.rateLimitCounter.hit()
+        if (config.log.rateLimitHits) {
+          this.log.warn(info)
         }
-        if (bot.shard && bot.shard.count > 0) bot.shard.send({ _drss: true, type: 'kill' })
-        else process.exit(0)
-      } else this.stop()
+      }
     })
     bot.on('resume', () => {
-      log.general.success(`${this.SHARD_PREFIX}Websocket resumed`)
+      this.log.info('Websocket resumed')
       this.start()
     })
     bot.on('disconnect', () => {
-      log.general.error(`${this.SHARD_PREFIX}Websocket disconnected`)
+      this.log.warn(`SH ${this.shardID} Websocket disconnected`)
+      const config = getConfig()
       if (config.bot.exitOnSocketIssues === true) {
-        log.general.info('Stopping all processes due to config.bot.exitOnSocketIssues')
-        if (this.scheduleManager) {
-          // Check if it exists first since it may disconnect before it's even initialized
-          for (const sched of this.scheduleManager.scheduleList) {
-            sched.killChildren()
-          }
-        }
-        if (bot.shard && bot.shard.count > 0) bot.shard.send({ _drss: true, type: 'kill' })
-        else process.exit(0)
-      } else this.stop()
+        this.log.general.info('Stopping all processes due to config.bot.exitOnSocketIssues')
+        this.sendKillMessage()
+      } else {
+        this.stop()
+      }
     })
-    log.general.success(`${this.SHARD_PREFIX}Discord.RSS has logged in as "${bot.user.username}" (ID ${bot.user.id})`)
-    if (!bot.shard || bot.shard.count === 0) this.start()
-    else process.send({ _drss: true, type: 'shardReady', shardId: bot.shard.id })
+    if (devLevels.dumpHeap()) {
+      this.setupHeapDumps()
+    }
+    this.log.info(`MonitoRSS has logged in as "${bot.user.username}" (ID ${bot.user.id})`)
+    ipc.send(ipc.TYPES.SHARD_READY, {
+      guildIds: bot.guilds.cache.keyArray(),
+      channelIds: bot.channels.cache.keyArray()
+    })
+  }
+
+  setupHeapDumps () {
+    // Every 10 minutes
+    const prefix = `s${this.bot.shard.ids[0]}`
+    dumpHeap(prefix)
+    setInterval(() => {
+      dumpHeap(prefix)
+    }, 1000 * 60 * 15)
   }
 
   listenToShardedEvents (bot) {
     process.on('message', async message => {
-      if (!message._drss) return
+      if (!ipc.isValid(message)) {
+        return
+      }
       try {
         switch (message.type) {
-          case 'kill' :
-            process.exit(0)
-          case 'startInit':
-            if (bot.shard.id === message.shardId) this.start()
+          case ipc.TYPES.KILL:
+            this.handleKillMessage()
             break
-          case 'stop':
-            this.stop()
+          case ipc.TYPES.START_INIT: {
+            const data = message.data
+            if (data.setPresence) {
+              const config = getConfig()
+              bot.user.setPresence({
+                status: config.bot.status,
+                activity: {
+                  name: config.bot.activityName,
+                  type: config.bot.activityType,
+                  url: config.bot.streamActivityURL || undefined
+                }
+              }).catch(err => this.log.warn({
+                error: err
+              }, 'Failed to set presence'))
+            }
+            this.start()
             break
-          case 'finishedInit':
-            storage.initialized = 2
-            if (config.database.uri.startsWith('mongodb')) await dbOpsBlacklists.refresh()
+          }
+          case ipc.TYPES.NEW_ARTICLE:
+            this.onNewArticle(message.data.newArticle, message.data.debug)
             break
-          case 'cycleVIPs':
-            if (bot.shard.id === message.shardId) await dbOpsVips.refresh(true)
+          case ipc.TYPES.FINISHED_INIT:
             break
-          case 'runSchedule':
-            if (bot.shard.id === message.shardId) this.scheduleManager.run(message.refreshRate)
-            break
-          case 'failedLinks._sendAlert':
-            dbOpsFailedLinks._sendAlert(message.link, message.message, true)
-            break
-          case 'blacklists.uniformize':
-            await dbOpsBlacklists.uniformize(message.blacklistGuilds, message.blacklistUsers, true)
-            break
-          case 'dbRestoreSend':
-            const channel = bot.channels.get(message.channelID)
-            if (!channel) return
-            const channelMsg = channel.messages.get(message.messageID)
-            if (channelMsg) channelMsg.edit('Database restore complete! Stopping bot process for manual reboot.').then(m => bot.shard.send({ _drss: true, type: 'kill' }))
-            else channel.send('Database restore complete! Stopping bot process for manual reboot.').then(m => bot.shard.send({ _drss: true, type: 'kill' }))
-            break
+          case ipc.TYPES.SEND_USER_ALERT:
+            this.sendUserAlert(message.data.channel, message.data.message)
+              .catch(err => this.log.warn(`Failed to send inter-process alert to channel ${message.data.channel}`, err))
         }
       } catch (err) {
-        log.general.warning('client', err, true)
+        this.log.error(err, 'client')
       }
     })
   }
 
+  async onNewArticle (newArticle, debug) {
+    try {
+      await this.deliveryPipeline.deliver(newArticle, debug)
+    } catch (err) {
+      this.log.error(err, 'Delivery pipeline')
+    }
+  }
+
+  async sendChannelMessage (channelID, message) {
+    const channel = this.bot.channels.cache.get(channelID)
+    if (!channel) {
+      return
+    }
+    /**
+     * @type {import('discord.js').GuildMember}
+     */
+    const guildMeMember = channel.guild.me
+    if (!guildMeMember.permissionsIn(channel).has(Discord.Permissions.FLAGS.SEND_MESSAGES)) {
+      this.log.warn({
+        channel,
+        string: message
+      }, 'Failed to send Client message to channel')
+      return
+    }
+    channel.send(message)
+  }
+
+  async sendUserAlert (channelID, message) {
+    const fetchedChannel = this.bot.channels.cache.get(channelID)
+    if (!fetchedChannel) {
+      return
+    }
+    const alertMessage = `**ALERT**\n\n${message}`
+    try {
+      const profile = await Profile.get(fetchedChannel.guild.id)
+      if (!profile) {
+        return this.sendChannelMessage(channelID, alertMessage)
+      }
+      const alertTo = profile.alert
+      for (const id of alertTo) {
+        const user = await this.bot.users.fetch(id, false)
+        if (user) {
+          await user.send(alertMessage)
+        }
+      }
+    } catch (err) {
+      this.log.warn({
+        error: err
+      }, `Failed to send user alert to channel ${channelID}`)
+      return this.sendChannelMessage(alertMessage)
+    }
+  }
+
   async start () {
     if (this.state === STATES.STARTING || this.state === STATES.READY) {
-      return log.general.warning(`${this.SHARD_PREFIX}Ignoring start command because of ${this.state} state`)
+      return this.log.warn(`Ignoring start command because of ${this.state} state`)
     }
+    const config = getConfig()
+    const disableCommands = devLevels.disableCommands() || !config.bot.enableCommands
     this.state = STATES.STARTING
-    listeners.enableCommands()
-    const uri = config.database.uri
-    log.general.info(`Database URI ${uri} detected as a ${uri.startsWith('mongo') ? 'MongoDB URI' : 'folder URI'}`)
     try {
-      await connectDb()
-      if (!this.bot.shard || this.bot.shard.count === 0) {
-        await dbOpsGeneral.verifyFeedIDs()
-        await redisIndex.flushDatabase()
+      if ((this.mongo && this.mongo.readyState !== 1) || Profile.isMongoDatabase) {
+        this.mongo = await this.connectToDatabase()
       }
-      if (!this.scheduleManager) {
-        const refreshRates = new Set()
-        refreshRates.add(config.feeds.refreshRateMinutes)
-        this.scheduleManager = new ScheduleManager(storage.bot)
-        const addSchedulePromises = []
-        addSchedulePromises.push(this.scheduleManager.addSchedule({ name: 'default', refreshRateMinutes: config.feeds.refreshRateMinutes }, false, true))
-        if (config._vip === true) {
-          if (!config._vipRefreshRateMinutes || config.feeds.refreshRateMinutes === config._vipRefreshRateMinutes) {
-            throw new Error('Missing valid VIP refresh rate')
-          }
-          refreshRates.add(config._vipRefreshRateMinutes)
-          addSchedulePromises.push(this.scheduleManager.addSchedule({ name: 'vip', refreshRateMinutes: config._vipRefreshRateMinutes, feedIDs: [] }, false, true))
-        }
-        const names = new Set()
-        for (const schedule of this.customSchedules) {
-          const name = schedule.name
-          if (name === 'example') {
-            continue
-          }
-          if (names.has(name)) {
-            throw new Error(`Schedules cannot have the same name (${name})`)
-          }
-          names.add(name)
-          addSchedulePromises.push(this.scheduleManager.addSchedule(schedule, false, true))
-          if (refreshRates.has(schedule.refreshRateMinutes)) {
-            throw new Error('Duplicate schedule refresh rates are not allowed')
-          }
-          refreshRates.add(schedule.refreshRateMinutes)
-        }
-        await Promise.all(addSchedulePromises)
-        storage.scheduleManager = this.scheduleManager
-      }
-      await this.scheduleManager.assignAllSchedules()
-      const { missingGuilds, activeLinks } = await initialize(this.bot)
-
-      storage.initialized = 2
+      await initialize.setupModels(this.mongo)
+      await initialize.setupCommands(disableCommands)
+      const uri = config.database.uri
+      this.log.info(`Database URI detected as a ${uri.startsWith('mongo') ? 'MongoDB URI' : 'folder URI'}`)
+      await maintenance.pruneWithBot(this.bot)
       this.state = STATES.READY
-      if (storage.bot.shard && storage.bot.shard.count > 0) {
-        process.send({ _drss: true, type: 'initComplete', missingGuilds, activeLinks, shard: storage.bot.shard.id })
-      } else {
-        if (config.web.enabled === true) {
-          this.webClientInstance.enableCP()
-        }
-        if (config._vip === true) {
-          this._vipInterval = setInterval(() => {
-            dbOpsVips.refresh().catch(err => log.general.error('Unable to refresh vips on timer', err, true))
-          }, 600000)
-        }
-      }
-      listeners.createManagers(storage.bot)
-      this.scheduleManager.startSchedules()
-      // if (!this.bot.shard || this.bot.shard.count === 0) this.scheduleManager.run()
+      await initialize.setupRateLimiters(this.bot)
+      this.log.info(`Commands have been ${config.bot.enableCommands ? 'enabled' : 'disabled'}.`)
+      ipc.send(ipc.TYPES.INIT_COMPLETE)
+      listeners.createManagers(this.bot, disableCommands)
       this.emit('finishInit')
     } catch (err) {
-      log.general.error(`Client start`, err, true)
+      this.log.error(err, 'Client start')
+    }
+  }
+
+  handleKillMessage () {
+    this.state = STATES.EXITING
+    this.log.info('Received kill signal from sharding manager, closing MongoDB connection')
+    if (this.bot) {
+      this.bot.destroy()
+    }
+    if (this.restHandler) {
+      this.restHandler.disconnectRedis()
+    }
+    const handleMongoClose = (err) => {
+      if (err) {
+        this.log.error(err, 'Failed to close mongo connection on shard kill message')
+      }
+      this.log.info('Exiting with status code 1')
+      process.exit(1)
+    }
+    if (this.mongo) {
+      this.mongo.close(handleMongoClose)
+    } else {
+      handleMongoClose()
+    }
+  }
+
+  sendKillMessage () {
+    this.log.info('Sending kill signal to sharding manager')
+    const handleMongoClose = (err) => {
+      this.log.error(err, 'Failed to close mongo connection on shard kill message emit')
+      ipc.send(ipc.TYPES.KILL)
+    }
+    if (this.mongo) {
+      this.mongo.close(handleMongoClose)
+    } else {
+      handleMongoClose()
     }
   }
 
   stop () {
-    if (this.state === STATES.STARTING || this.state === STATES.STOPPED) {
-      return log.general.warning(`${this.SHARD_PREFIX}Ignoring stop command because of ${this.state} state`)
+    if (this.state === STATES.STARTING || this.state === STATES.STOPPED || this.state === STATES.EXITING) {
+      return this.log.warn(`Ignoring stop command because of ${this.state} state`)
     }
-    log.general.warning(`${this.SHARD_PREFIX}Discord.RSS has received stop command`)
-    storage.initialized = 0
-    this.scheduleManager.stopSchedules()
-    clearInterval(this._vipInterval)
-    listeners.disableAll()
-    if ((!storage.bot.shard || storage.bot.shard.count === 0) && config.web.enabled === true) {
-      this.webClientInstance.disableCP()
-    }
+    this.log.info('MonitoRSS has received stop command')
+    clearInterval(this.maintenance)
+    listeners.disableAll(this.bot)
     this.state = STATES.STOPPED
+    ipc.send(ipc.TYPES.SHARD_STOPPED)
   }
 
   async restart () {
-    if (this.state === STATES.STARTING) return log.general.warning(`${this.SHARD_PREFIX}Ignoring restart command because of ${this.state} state`)
-    if (this.state === STATES.READY) this.stop()
+    if (this.state === STATES.STARTING) {
+      return this.log.warn(`Ignoring restart command because of ${this.state} state`)
+    }
+    if (this.state === STATES.READY) {
+      this.stop()
+    }
     return this.start()
-  }
-
-  disableCommands () {
-    listeners.disableCommands()
-    return this
   }
 }
 

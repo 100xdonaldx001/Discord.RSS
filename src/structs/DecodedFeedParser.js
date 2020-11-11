@@ -1,18 +1,22 @@
 const FeedParser = require('feedparser')
 const iconv = require('iconv-lite')
-const config = require('../config.js')
+const getConfig = require('../config.js').get
 
 class DecodedFeedParser extends FeedParser {
-  constructor (options, url) {
+  constructor (options, url, charset) {
     super(options)
     this.url = url
+    this.charset = charset
   }
 
   _transform (chunk, encoding, done) {
-    if (!config.feeds.decode || !config.feeds.decode[this.url]) this.stream.write(chunk)
-    else {
-      const encoding = config.feeds.decode[this.url]
-      this.stream.write(iconv.decode(chunk, encoding === 'auto' ? require('chardet').detect(chunk) : encoding)) // Assumes that the encoding specified is valid, and will not check via iconv.encodingExists()
+    const config = getConfig()
+    const charset = config.feeds.decode[this.url] || this.charset
+    if (/utf-*8/i.test(charset) || !charset || !iconv.encodingExists(charset)) {
+      this.stream.write(chunk)
+    } else {
+      // Assumes that the encoding specified is valid, and will not check via iconv.encodingExists()
+      this.stream.write(iconv.decode(chunk, charset))
     }
     done()
   }

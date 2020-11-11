@@ -1,10 +1,10 @@
+const DEFAULT_LOCALE = 'en-US'
 const fs = require('fs')
 const path = require('path')
-const config = require('../config.js')
-const log = require('../util/logger.js')
-const defaultLocale = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'locales', config.bot.locale + '.json')))
-const localesData = new Map()
+const defaultLocale = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'locales', `${DEFAULT_LOCALE}.json`)))
 const fileList = fs.readdirSync(path.join(__dirname, '..', 'locales'))
+
+const localesData = new Map()
 for (const file of fileList) {
   const read = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'locales', file)))
   localesData.set(file.replace('.json', ''), read)
@@ -15,7 +15,7 @@ function escapeRegExp (str) {
 }
 
 class Translator {
-  constructor (locale = config.bot.locale) {
+  constructor (locale = DEFAULT_LOCALE) {
     /**
      * Locale string
      * @type {string}
@@ -59,6 +59,15 @@ class Translator {
   }
 
   /**
+   * Gets the locale from a profile and creates a translate func
+   * @param {import('./db/Profile.js')} profile
+   */
+  static createProfileTranslator (profile) {
+    const locale = profile ? profile.locale : undefined
+    return this.createLocaleTranslator(locale)
+  }
+
+  /**
    * Check if a locale exists
    * @param {string} locale
    * @returns {boolean}
@@ -80,7 +89,7 @@ class Translator {
    * @param {string} locale
    * @returns {Object.<string, object>}
    */
-  static getCommandDescriptions (locale = config.bot.locale) {
+  static getCommandDescriptions (locale = DEFAULT_LOCALE) {
     return this.LOCALES_DATA.get(locale).commandDescriptions
   }
 
@@ -91,7 +100,7 @@ class Translator {
    * @param {Object.<string, number|string>} [params] - Keys to replace in the string
    * @returns {string}
    */
-  static translate (string, locale = config.bot.locale, params) {
+  static translate (string, locale = DEFAULT_LOCALE, params) {
     if (typeof string !== 'string') {
       throw new TypeError('string is not a string')
     }
@@ -108,16 +117,13 @@ class Translator {
       accessedSoFar = accessedSoFar[property]
       reference = reference[property]
       if (accessedSoFar === undefined) {
-        log.general.error(`Invalid locale accessor ("${string}" stopped at "${property}") for locale ${locale}`)
         throw new Error(`Invalid locale accessor (stopped at "${property}") for locale ${locale}`)
       }
       if (!reference) {
-        log.general.error(`Invalid locale accessor (no en-US locale reference of "${string}" at "${property}") for locale ${locale}`)
         throw new Error(`Invalid locale accessor (no en-US locale reference at "${property}") for locale ${locale}`)
       }
     }
     if (typeof accessedSoFar !== 'string') {
-      log.general.error(`Invalid locale accessor that stopped with a non-string value ("${string}") for locale ${locale}`)
       throw new Error(`Invalid locale accessor that stopped with a non-string value for locale ${locale}`)
     }
     if (accessedSoFar.length === 0) {

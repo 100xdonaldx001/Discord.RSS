@@ -1,217 +1,331 @@
-const config = require('../config.js')
-const FeedSchedule = require('./FeedSchedule.js')
-const debugFeeds = require('../util/debugFeeds.js').list
-const ArticleMessageQueue = require('./ArticleMessageQueue.js')
-const log = require('../util/logger.js')
-const dbOpsSchedules = require('../util/db/schedules.js')
-const dbOpsGuilds = require('../util/db/guilds.js')
-const dbOpsVips = require('../util/db/vips.js')
-const AssignedScheduleModel = require('../models/AssignedSchedule.js')
-const ArticleModel = require('../models/Article.js')
+const FailRecord = require('../structs/db/FailRecord.js')
+const ScheduleRun = require('./ScheduleRun.js')
+const createLogger = require('../util/logger/create.js')
+const EventEmitter = require('events').EventEmitter
+const getConfig = require('../config.js').get
+const devLevels = require('../util/devLevels.js')
+const dumpHeap = require('../util/dumpHeap.js')
 
-class ScheduleManager {
-  constructor (bot) {
-    this.bot = bot
-    this.articleMessageQueue = new ArticleMessageQueue()
-    this.scheduleList = []
+/**
+ * @typedef {string} FeedURL
+ */
+
+/**
+ * @typedef {Object<FeedURL, Object<string, any>[]>} MemoryCollection
+ */
+
+class ScheduleManager extends EventEmitter {
+  constructor () {
+    super()
+    this.log = createLogger('M')
+    this.timers = []
+    /**
+     * @type {Set<string>}
+     */
+    this.debugFeedIDs = new Set()
+    /**
+     * @type {import('./db/Schedule.js')[]}
+     * */
+    this.schedules = []
+    /**
+     * @type {import('./ScheduleRun.js')[]}
+     * */
+    this.scheduleRuns = []
+    /**
+     * @type {Map<import('./db/Schedule.js'), number>}
+     */
+    this.scheduleRunCounts = new Map()
+    this.urlFailuresRecording = new Set()
+    this.urlSuccessesRecording = new Set()
+    this.sendingEnabledNotifications = new Set()
+    this.sendingDisabledNotifications = new Set()
   }
 
-  async _queueArticle (article) {
-    if (debugFeeds.includes(article._delivery.rssName)) {
-      log.debug.info(`${article._delivery.rssName} ScheduleManager queueing article ${article.link} to send`)
+  async _onNewArticle (newArticle) {
+    const { article, feedObject } = newArticle
+    if (devLevels.disableOutgoingMessages()) {
+      return
     }
+    if (this.debugFeedIDs.has(feedObject._id)) {
+      this.log.info(`${feedObject._id} ScheduleManager queueing article ${article.link} to send`)
+    }
+    this.emit('newArticle', newArticle)
+  }
+
+  /**
+   * Handle fail records in ScheduleManager since multiple
+   * runs could be trying to record the same failure at the
+   * same time, causing race conditions
+   *
+   * @param {string} url
+   * @param {string} [reason]
+   */
+  async _onConnectionFailure (url, reason) {
+    if (this.urlFailuresRecording.has(url) || this.testRuns || devLevels.disableCycleDatabase()) {
+      return
+    }
+    this.urlFailuresRecording.add(url)
     try {
-      await this.articleMessageQueue.enqueue(article)
+      await FailRecord.record(url, reason)
     } catch (err) {
-      if (config.log.linkErrs === true) {
-        const channel = this.bot.channels.get(article._delivery.source.channel)
-        log.general.warning(`Failed to send article ${article.link}`, channel.guild, channel, err)
-        if (err.code === 50035) {
-          channel.send(`Failed to send formatted article for article <${article.link}> due to misformation.\`\`\`${err.message}\`\`\``).catch(err => log.general.warning(`Unable to send failed-to-send message for article`, err))
-        }
-      }
+      this.log.error(err, `Failed to record url fail record ${url} with reason ${reason}`)
     }
+    this.urlFailuresRecording.delete(url)
   }
 
-  _finishSchedule () {
-    this.articleMessageQueue.send(this.bot)
-      .catch(err => log.general.error('Failed to send a delayed articleMessage', err, err.guild, true))
+  /**
+   * @param {string} url
+   */
+  async _onConnectionSuccess (url) {
+    if (this.urlSuccessesRecording.has(url) || this.testRuns) {
+      return
+    }
+    this.urlSuccessesRecording.add(url)
+    try {
+      await FailRecord.reset(url)
+    } catch (err) {
+      this.log.error(err, `Failed to reset url fail record ${url}`)
+    }
+    this.urlSuccessesRecording.delete(url)
   }
 
-  async addSchedule (schedule, assignAllSchedules, doNotStart) {
-    if (!schedule) {
-      throw new TypeError('Undefined schedule')
+  /**
+   * @param {import('./db/Feed.js')} feed
+   */
+  async _onFeedDisabled (feed) {
+    if (this.sendingDisabledNotifications.has(feed._id) || devLevels.disableOutgoingMessages()) {
+      return
     }
-    if (schedule.name !== 'default' && (!schedule.refreshRateMinutes || (!schedule.keywords && !schedule.feedIDs))) {
-      throw new TypeError('refreshRateMinutes, keywords or feedIDs is missing in schedule to addSchedule')
-    }
-    if (this.scheduleList.length === 0 && (!this.bot.shard || this.bot.shard.count === 0)) {
-      await dbOpsSchedules.schedules.clear() // Only clear if it is unsharded, otherwise it's clearing multiple times on multiple shards
-    }
-    const feedSchedule = new FeedSchedule(this.bot, schedule, this)
-    await dbOpsSchedules.schedules.add(schedule.name, schedule.refreshRateMinutes)
-    this.scheduleList.push(feedSchedule)
-    feedSchedule.on('article', this._queueArticle.bind(this))
-    feedSchedule.on('finish', this._finishSchedule.bind(this))
-    if (this.bot.shard && this.bot.shard.count > 0) {
-      process.send({ _drss: true, type: 'addCustomSchedule', schedule: schedule })
-    }
-    if (assignAllSchedules) {
-      await this.assignAllSchedules()
-    }
-    if (!doNotStart) {
-      feedSchedule.start()
-    }
+    this.sendingDisabledNotifications.add(feed._id)
+    const message = `Feed <${feed.url}> has been disabled in <#${feed.channel}> to due limit changes.`
+    this.log.info(`Sending disabled notification for feed ${feed._id} in channel ${feed.channel}`)
+    this.emitAlert(feed.channel, message)
+    this.sendingDisabledNotifications.delete(feed._id)
   }
 
-  run (refreshRate) { // Run schedules with respect to their refresh times
-    for (var feedSchedule of this.scheduleList) {
-      if (feedSchedule.refreshRate === refreshRate) {
-        return feedSchedule.run().catch(err => log.cycle.error(`${this.bot.shard && this.bot.shard.count > 0 ? `SH ${this.bot.shard.id} ` : ''}Schedule ${this.name} failed to run cycle`, err))
-      }
+  /**
+   * @param {import('./db/Feed.js')} feed
+   */
+  async _onFeedEnabled (feed) {
+    if (this.sendingEnabledNotifications.has(feed._id) || devLevels.disableOutgoingMessages()) {
+      return
     }
-    // If there is no schedule with that refresh time
-    if (this.bot.shard && this.bot.shard.count > 0) process.send({ _drss: true, type: 'scheduleComplete', refreshRate })
+    this.sendingEnabledNotifications.add(feed._id)
+    const message = `Feed <${feed.url}> has been enabled in <#${feed.channel}> to due limit changes.`
+    this.log.info(`Sending enabled notification for feed ${feed._id} in channel ${feed.channel}`)
+    this.emitAlert(feed.channel, message)
+    this.sendingEnabledNotifications.delete(feed._id)
   }
 
-  stopSchedules () {
-    this.scheduleList.forEach(schedule => schedule.stop())
-  }
-
-  startSchedules () {
-    this.scheduleList.forEach(schedule => schedule.start())
-  }
-
-  getSchedule (name) {
-    for (const schedule of this.scheduleList) {
-      if (schedule.name === name) return schedule
+  /**
+   * @param {import('./db/FailRecord.js')} record
+   */
+  async alertFailRecord (record) {
+    if (devLevels.disableOutgoingMessages()) {
+      return
     }
-  }
-
-  async assignAllSchedules () {
-    // Remove the old schedules
-    if (!this.bot.shard || this.bot.shard.count === 0) {
-      // Only clear if it is unsharded, otherwise it's clearing multiple times on multiple shards
-      await dbOpsSchedules.assignedSchedules.clear()
-    }
-
-    const schedulesByName = {}
-    for (const schedule of this.scheduleList) {
-      schedulesByName[schedule.name] = schedule
-    }
-
-    const guildRssList = await dbOpsGuilds.getAll()
-    const vipServers = []
-    if (config._vip === true) {
-      const vipUsers = await dbOpsVips.getAll()
-      for (const vipUser of vipUsers) {
-        if (vipUser.invalid || vipUser.regularRefreshRate) continue
-        for (const serverId of vipUser.servers) vipServers.push(serverId)
-      }
-    }
-    const scheduleDeterminationPromises = []
-    const feedRecords = []
-    guildRssList.forEach(guildRss => {
-      if (!this.bot.guilds.has(guildRss.id)) return
-      const rssList = guildRss.sources
-      for (const rssName in rssList) {
-        scheduleDeterminationPromises.push(this.determineSchedule(rssName, guildRss, vipServers))
-        feedRecords.push({ feedID: rssName, guildID: guildRss.id, link: rssList[rssName].link })
-      }
+    const config = getConfig()
+    const url = record._id
+    record.alerted = true
+    await record.save()
+    const feeds = await record.getAssociatedFeeds()
+    this.log.info(`Sending fail notification for ${url} to ${feeds.length} channels`)
+    feeds.forEach(({ channel }) => {
+      const message = `Feed <${url}> in channel <#${channel}> has reached the connection failure limit after continuous (${config.feeds.hoursUntilFail} hours) connection failures (recorded reason: ${record.reason}). The feed will not be retried until it is manually refreshed by any server using this feed. Use the \`list\` command in your server for more information.`
+      this.emitAlert(channel, message)
     })
-    const scheduleNames = await Promise.all(scheduleDeterminationPromises)
-
-    const documentsToInsert = []
-    const AssignedSchedule = AssignedScheduleModel.model()
-    const shard = this.bot.shard && this.bot.shard.count > 0 ? this.bot.shard.id : -1
-    for (let i = 0; i < scheduleNames.length; ++i) {
-      const scheduleName = scheduleNames[i]
-      const { feedID, link, guildID } = feedRecords[i]
-      const toInsert = { feedID, schedule: scheduleName, link, guildID, shard }
-      documentsToInsert.push(new AssignedSchedule(toInsert))
-    }
-
-    await dbOpsSchedules.assignedSchedules.setMany(documentsToInsert)
   }
 
-  async determineSchedule (rssName, guildRss, vipServers) {
-    if (config._vip === true && !vipServers) {
-      vipServers = []
-      const vipUsers = await dbOpsVips.getAll()
-      for (const vipUser of vipUsers) {
-        if (vipUser.invalid) continue
-        for (const serverId of vipUser.servers) vipServers.push(serverId)
-      }
-    }
+  /**
+   * @param {string} channelID
+   * @param {string} message
+   */
+  emitAlert (channelID, message) {
+    this.emit('alert', channelID, message)
+  }
 
-    const shardID = this.bot.shard ? this.bot.shard.id : undefined
-    const source = guildRss.sources[rssName]
-    let assignedSchedule = await dbOpsSchedules.assignedSchedules.get(rssName, shardID)
+  /**
+   * Add a schedule and initialize relevant data for it
+   *
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  addSchedule (schedule) {
+    this.schedules.push(schedule)
+    this.scheduleRunCounts.set(schedule, 0)
+  }
 
-    // Take care of our VIPs
-    if (!source.link) {
-      console.log(guildRss)
-      console.log(source)
+  /**
+   * Add multiple schedules
+   *
+   * @param {import('./db/Schedule.js')[]} schedules
+   */
+  addSchedules (schedules) {
+    for (const schedule of schedules) {
+      this.addSchedule(schedule)
     }
-    if (config._vip === true && !source.link.includes('feed43')) {
-      const validVip = vipServers.includes(guildRss.id)
-      if (validVip) {
-        if (assignedSchedule !== 'vip') {
-          return 'vip'
+  }
+
+  /**
+   * Get current schedule runs of a schedule
+   *
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  getRuns (schedule) {
+    return this.scheduleRuns.filter(r => r.schedule === schedule)
+  }
+
+  /**
+   * @param {import('./ScheduleRun.js')} run
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  endRun (run, schedule) {
+    run.removeAllListeners()
+    this.scheduleRuns.splice(this.scheduleRuns.indexOf(run), 1)
+    this.incrementRunCount(schedule)
+    if (schedule.name === 'default' && devLevels.dumpHeap()) {
+      dumpHeap('schedulerun')
+    }
+  }
+
+  /**
+   * Terminate a run by killing its children, removing
+   * listeners and deleting it from storage
+   *
+   * @param {import('./ScheduleRun.js')} run
+   */
+  terminateRun (run) {
+    run.terminate()
+    this.scheduleRuns.splice(this.scheduleRuns.indexOf(run), 1)
+  }
+
+  /**
+   * Terminate all the runs of every schedule
+   */
+  terminateAllRuns () {
+    this.scheduleRuns.forEach((run) => {
+      this.terminateRun(run)
+    })
+  }
+
+  /**
+   * Terminate multiple runs of a schedule
+   *
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  terminateScheduleRuns (schedule) {
+    const runs = this.getRuns(schedule)
+    runs.forEach(r => this.terminateRun(r))
+  }
+
+  /**
+   * Check if the number of current runs of a schedule
+   * exceeds the max allowed
+   *
+   * @param {import('./db/Schedule')} schedule
+   */
+  atMaxRuns (schedule) {
+    const maxRuns = getConfig().advanced.parallelRuns
+    const runs = this.getRuns(schedule)
+    return runs.length === maxRuns
+  }
+
+  /**
+   * Increment run count of a schedule
+   *
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  incrementRunCount (schedule) {
+    const counts = this.scheduleRunCounts
+    counts.set(schedule, counts.get(schedule) + 1)
+  }
+
+  /**
+   * Record the failure of hung up URLs
+   *
+   * @param {string[]} urls
+   */
+  failURLs (urls) {
+    for (const url of urls) {
+      FailRecord.record(url)
+        .catch(err => this.log.error(err, `Unable to record url failure ${url}`))
+    }
+  }
+
+  /**
+   * Run a schedule
+   *
+   * @param {import('./db/Schedule.js')} schedule
+   */
+  async run (schedule) {
+    if (this.atMaxRuns(schedule)) {
+      const runs = this.getRuns(schedule)
+      const hungupURLs = runs.map(run => run.hasHungUpURLRecords() ? run.getHungUpURLs() : null)
+      this.log.warn({
+        urls: hungupURLs
+      }, `Previous schedule runs were not finished (${runs.length} run(s)). Terminating all runs. If repeatedly seeing this message, consider increasing your refresh rate.`)
+      hungupURLs.forEach((hangups) => {
+        if (hangups) {
+          this.failURLs(hangups.summary.flat(3))
         }
+      })
+      this.terminateScheduleRuns(schedule)
+    }
+    const runCount = this.scheduleRunCounts.get(schedule)
+    const run = new ScheduleRun(schedule, runCount, this.testRuns)
+    run.on('newArticle', this._onNewArticle.bind(this))
+    run.on('conFailure', this._onConnectionFailure.bind(this))
+    run.on('conSuccess', this._onConnectionSuccess.bind(this))
+    run.on('alertFail', this.alertFailRecord.bind(this))
+    // run.on('feedEnabled', this._onFeedEnabled.bind(this))
+    // run.on('feedDisabled', this._onFeedDisabled.bind(this))
+    this.scheduleRuns.push(run)
+    try {
+      await run.run(this.debugFeedIDs)
+      this.endRun(run, schedule)
+    } catch (err) {
+      this.log.error(err, 'Error during schedule run')
+      this.endRun(run, schedule)
+    }
+  }
+
+  /**
+   * Disable all schedule timers
+   */
+  clearTimers () {
+    if (this.timers.length === 0) {
+      return
+    }
+    this.timers.forEach(timer => clearInterval(timer))
+    this.timers.length = 0
+  }
+
+  /**
+   * Create auto-running schedule timers
+   */
+  beginTimers () {
+    const config = getConfig()
+    const immediatelyRun = config.bot.runSchedulesOnStart
+    this.clearTimers()
+    this.schedules.forEach(schedule => {
+      if (immediatelyRun) {
+        this.run(schedule)
       }
-    }
-
-    if (!assignedSchedule) {
-      for (const schedule of this.scheduleList) {
-        if (schedule.name === 'default' || (config._vip === true && schedule.name === 'vip')) continue
-        // Check if non-default schedules first
-        // rssnames first
-        const feedIDs = schedule.feedIDs // Potential array
-        if (feedIDs && feedIDs.has(rssName)) {
-          return schedule.name
-        }
-        // keywords second
-        const sKeywords = schedule.keywords
-        if (!sKeywords) continue
-        for (const word of sKeywords) {
-          if (!source.link.includes(word)) continue
-          return schedule.name
-        }
-      }
-
-      if (!assignedSchedule) return 'default'
-    }
+      this.timers.push(setInterval(() => {
+        this.run(schedule)
+      }, schedule.refreshRateMinutes * 60000))
+    })
   }
 
-  async reassignSchedule (feedID, guildRss, vipServers) {
-    await ScheduleManager.removeScheduleOfFeed(feedID, guildRss.sources[feedID].link)
-    await this.assignSchedule(feedID, guildRss, vipServers)
+  addDebugFeedID (feedID) {
+    this.debugFeedIDs.add(feedID)
   }
 
-  async assignSchedule (feedID, guildRss, vipServers) {
-    const scheduleName = await this.determineSchedule(feedID, guildRss, vipServers)
-    await dbOpsSchedules.assignedSchedules.set(feedID, scheduleName, guildRss.sources[feedID].link, guildRss.id)
-    return scheduleName
+  removeDebugFeedID (feedID) {
+    this.debugFeedIDs.delete(feedID)
   }
 
-  static async removeScheduleOfFeed (feedID, link, shardID) {
-    const assigned = await dbOpsSchedules.assignedSchedules.get(feedID)
-    if (!assigned) return
-    // const shardID = this.bot.shard ? this.bot.shard.id : 0
-    await dbOpsSchedules.assignedSchedules.remove(feedID)
-    const assignedSchedules = await dbOpsSchedules.assignedSchedules.getMany(shardID, assigned.schedule, link)
-    if (assignedSchedules.length === 0 && config.database.uri.startsWith('mongo')) {
-      ArticleModel.model(link, shardID, assigned.schedule).collection.drop().catch(err => err.code === 26 ? null : log.general.error('Failed to drop unused collection after feed removal', err))
-    }
-  }
-
-  cyclesInProgress (name) {
-    for (var feedSchedule of this.scheduleList.length) {
-      if (name && feedSchedule.name === name && feedSchedule.inProgress) return true
-      else if (feedSchedule.inProgress) return true
-    }
-    return false
+  isDebugging (feedID) {
+    return this.debugFeedIDs.has(feedID)
   }
 }
 

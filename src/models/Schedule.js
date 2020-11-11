@@ -1,12 +1,21 @@
 const mongoose = require('mongoose')
 
-const schema = mongoose.Schema({
+const schema = new mongoose.Schema({
   name: {
     type: String,
     unique: true
   },
-  refreshRateMinutes: Number
+  refreshRateMinutes: Number,
+  keywords: {
+    type: [String],
+    default: []
+  },
+  feeds: {
+    type: [mongoose.Types.ObjectId],
+    default: []
+  }
 })
 
 exports.schema = schema
-exports.model = () => mongoose.model('schedules', schema)
+/** @type {import('mongoose').Model} */
+exports.Model = null

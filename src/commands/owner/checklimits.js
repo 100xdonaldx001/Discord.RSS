@@ -1,31 +1,40 @@
-const log = require('../../util/logger.js')
-const dbOpsVips = require('../../util/db/vips.js')
-const dbOpsGuilds = require('../../util/db/guilds.js')
-const serverLimit = require('../../util/serverLimit.js')
+const Feed = require('../../structs/db/Feed.js')
+const Supporter = require('../../structs/db/Supporter.js')
+const getConfig = require('../../config.js').get
 
-exports.normal = async (bot, message) => {
-  try {
-    const allVips = await dbOpsVips.getAll()
-    const guildRssList = await dbOpsGuilds.getAll()
-    const illegals = []
-    guildRssList.forEach(guildRss => {
-      const { max } = serverLimit(guildRss.id, allVips)
-      let activeFeeds = 0
-      const rssList = guildRss.sources
-      if (rssList) {
-        for (const rssName in rssList) {
-          if (!rssList[rssName].disabled) ++activeFeeds
-        }
-      }
-      if (activeFeeds > max) illegals.push(guildRss.id)
-    })
+module.exports = async (message) => {
+  const supporters = await Supporter.getValidSupporters()
+  const supporterLimits = new Map()
+  const config = getConfig()
+  for (const supporter of supporters) {
+    const limit = await supporter.getMaxFeeds()
+    const guilds = supporter.guilds
+    for (const id of guilds) {
+      supporterLimits.set(id, limit)
+    }
+  }
 
-    if (illegals.length === 0) await message.channel.send(`Everything looks good!`)
-    else await message.channel.send(`Illegal sources found for the following guilds: \n\`\`\`${illegals}\`\`\``)
-  } catch (err) {
-    log.owner.warning('checklimits', err)
-    if (err.code !== 50013) message.channel.send(err.message).catch(err => log.owner.warning('checklimits 1a', message.guild, err))
+  const illegals = []
+  const guildIds = message.client.guilds.cache.keyArray()
+  const promises = []
+  for (const id of guildIds) {
+    promises.push(Feed.getBy('guild', id))
+  }
+
+  /** @type {Array<Feed[]>} */
+  const results = (await Promise.all(promises))
+  for (let i = 0; i < guildIds.length; ++i) {
+    const guildId = guildIds[i]
+    const guildFeeds = results[i].filter(feed => !feed.disabled)
+    const limit = supporterLimits.get(guildId) || config.feeds.max
+    if (guildFeeds.length > limit) {
+      illegals.push(guildId)
+    }
+  }
+
+  if (illegals.length === 0) {
+    await message.channel.send('Everything looks good!')
+  } else {
+    await message.channel.send(`Illegal sources found for the following guilds: \n\`\`\`${illegals}\`\`\``)
   }
 }
-
-exports.sharded = exports.normal

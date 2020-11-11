@@ -1,12 +1,11 @@
 const fetch = require('node-fetch')
-const config = require('../config.js')
-const cloudscraper = require('cloudscraper') // For cloudflare
+const AbortController = require('abort-controller').AbortController
 const RequestError = require('../structs/errors/RequestError.js')
 const FeedParserError = require('../structs/errors/FeedParserError.js')
 const DecodedFeedParser = require('../structs/DecodedFeedParser.js')
 const ArticleIDResolver = require('../structs/ArticleIDResolver.js')
 const Article = require('../structs/Article.js')
-const testFilters = require('../rss/translator/filters.js')
+const configuration = require('../config.js')
 
 class FeedFetcher {
   constructor () {
@@ -19,6 +18,93 @@ class FeedFetcher {
 
   static get FEEDPARSER_ERROR_CODE () {
     return 40002
+  }
+
+  /**
+   * @typedef {Object} FormattedResponse
+   * @property {number} status
+   * @property {Object} headers
+   */
+
+  /**
+   * @param {string} url
+   * @param {string} userAgent
+   */
+  static resolveUserAgent (url, userAgent) {
+    if (url.includes('.tumblr.com')) {
+      // tumblr only allows GoogleBot to automatically view NSFW feeds
+      const tempParts = userAgent.split(' ')
+      tempParts.splice(1, 0, 'GoogleBot')
+      return tempParts.join(' ')
+    } else {
+      return userAgent
+    }
+  }
+
+  /**
+   * Responses must be uniform
+   * @param {import('node-fetch').Response} res
+   * @returns {FormattedResponse}
+   */
+  static formatNodeFetchResponse (res) {
+    const rawHeaders = res.headers.raw()
+    const headers = {
+      ...rawHeaders
+    }
+    // Normalize the headers
+    for (const key in headers) {
+      const val = headers[key]
+      delete headers[key]
+      headers[key.toLowerCase()] = val
+    }
+    // Sometimes it's an array for some reason
+    if (Array.isArray(headers.etag)) {
+      headers.etag = headers.etag[0]
+    }
+    if (Array.isArray(headers['last-modified'])) {
+      headers['last-modified'] = headers['last-modified'][0]
+    }
+    if (Array.isArray(headers['content-type'])) {
+      headers['content-type'] = headers['content-type'][0]
+    }
+    return {
+      status: res.status,
+      headers
+    }
+  }
+
+  /**
+   * @param {string} url
+   * @param {Object<string, any>} requestOptions
+   */
+  static createFetchOptions (url, requestOptions = {}) {
+    const config = configuration.get()
+    const options = {
+      follow: 5,
+      ...requestOptions,
+      headers: {
+        'user-agent': this.resolveUserAgent(url, config.bot.userAgent)
+      }
+    }
+
+    if (requestOptions.headers) {
+      options.headers = {
+        ...options.headers,
+        ...requestOptions.headers
+      }
+    }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => {
+      controller.abort()
+    }, 15000)
+
+    options.signal = controller.signal
+
+    return {
+      options,
+      timeout
+    }
   }
 
   /**
@@ -36,28 +122,16 @@ class FeedFetcher {
    */
   static async fetchURL (url, requestOptions = {}, retried) {
     if (!url) throw new Error('No url defined')
-    const options = {
-      timeout: 15000,
-      follow: 5,
-      ...requestOptions,
-      headers: {
-        'user-agent': `Mozilla/5.0 ${url.includes('.tumblr.com') ? 'GoogleBot' : ''} (Macintosh; Intel Mac OS X 10_8_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/31.0.1650.63 Safari/537.36`
-      }
-    }
-
-    if (requestOptions.headers) {
-      options.headers = {
-        ...options.headers,
-        ...requestOptions.headers
-      }
-    }
+    const { options, timeout } = this.createFetchOptions(url, requestOptions)
     let endStatus
     let res
 
     try {
       res = await fetch(url, options)
     } catch (err) {
-      throw new RequestError(err.message)
+      throw new RequestError(null, err.message === 'The user aborted a request.' ? 'Connected timed out' : err.message)
+    } finally {
+      clearTimeout(timeout)
     }
 
     endStatus = res.status
@@ -66,12 +140,18 @@ class FeedFetcher {
     if (res.status === 200 || (res.status === 304 && 'If-Modified-Since' in options.headers && 'If-None-Match' in options.headers)) {
       return {
         stream: res.body,
-        response: res
+        response: this.formatNodeFetchResponse(res)
       }
     }
     if (!retried && (res.status === 403 || res.status === 400)) {
       delete options.headers
-      const res2 = await this.fetchURL(url, { ...options, headers: { ...options.headers, 'user-agent': '' } }, true)
+      const res2 = await this.fetchURL(url, {
+        ...options,
+        headers: {
+          ...options.headers,
+          'user-agent': ''
+        }
+      }, true)
       endStatus = res2.response.status
       if (endStatus === 200) {
         return res2
@@ -83,39 +163,14 @@ class FeedFetcher {
       throw new RequestError(this.REQUEST_ERROR_CODE, `Bad status code (${endStatus})`)
     }
 
-    // Cloudflare is used here
-    if (config._vip) {
-      throw new RequestError(this.REQUEST_ERROR_CODE, `Bad Cloudflare status code (${endStatus}) (Unsupported on public bot)`, true)
-    }
-    return this.fetchCloudScraper(url)
+    // Cloudflare errors
+    throw new RequestError(endStatus, `Bad Cloudflare status code (${endStatus})`, true)
   }
   /**
-   * @typedef CSResults
-   * @param {import('stream').Readable} stream
+   * @typedef {Object} CSResults
+   * @property {import('stream').Readable} stream
+   * @property {Object<string, any>} response
    */
-
-  /**
-   * Fetch a feed with cloudscraper instead of node-fetch for cloudflare feeds.
-   * Takes significantly longer than node-fetch.
-   * @param {string} uri - URL to fetch
-   * @returns {CSResults}
-   */
-  static async fetchCloudScraper (uri) {
-    if (!uri) {
-      throw new Error('No url defined')
-    }
-    const res = await cloudscraper({ method: 'GET', uri, resolveWithFullResponse: true })
-    if (res.statusCode !== 200) {
-      throw new RequestError(this.REQUEST_ERROR_CODE, `Bad Cloudflare status code (${res.statusCode})`, true)
-    }
-    const Readable = require('stream').Readable
-    const feedStream = new Readable()
-    feedStream.push(res.body)
-    feedStream.push(null)
-    return {
-      stream: feedStream
-    }
-  }
 
   /**
  * @typedef {object} FeedData
@@ -127,18 +182,26 @@ class FeedFetcher {
    * Parse a stream and return the article list, and the article ID type used
    * @param {object} stream
    * @param {string} url - The fetched URL of this stream
+   * @param {charset} [encoding] - Response charset
    * @returns {FeedData} - The article list and the id type used
    */
-  static async parseStream (stream, url) {
+  static async parseStream (stream, url, charset) {
     if (!url) {
       throw new Error('No url defined')
     }
-    const feedparser = new DecodedFeedParser(null, url)
+    const feedparser = new DecodedFeedParser(null, url, charset)
     const idResolver = new ArticleIDResolver()
     const articleList = []
 
     return new Promise((resolve, reject) => {
-      stream.on('error', err => reject(new RequestError(this.REQUEST_ERROR_CODE, err.message))) // feedparser may not handle all errors such as incorrect headers. (feedparser v2.2.9)
+      setTimeout(() => {
+        reject(new FeedParserError(null, 'Feed parsing took too long'))
+      }, 10000)
+
+      stream.on('error', err => {
+        // feedparser may not handle all errors such as incorrect headers. (feedparser v2.2.9)
+        reject(new FeedParserError(this.REQUEST_ERROR_CODE, err.message))
+      })
 
       feedparser.on('error', err => {
         feedparser.removeAllListeners('end')
@@ -182,9 +245,22 @@ class FeedFetcher {
    * @returns {FeedData} - The article list and the id type used
    */
   static async fetchFeed (url, options) {
-    const { stream } = await this.fetchURL(url, options)
-    const { articleList, idType } = await this.parseStream(stream, url)
+    const { stream, response } = await this.fetchURL(url, options)
+    const charset = this.getCharsetFromResponse(response)
+    const { articleList, idType } = await this.parseStream(stream, url, charset)
     return { articleList, idType }
+  }
+
+  static async fetchFilteredFeed (url, filters) {
+    const { articleList, idType } = await this.fetchFeed(url)
+    const filtered = articleList.filter(article => {
+      const parsed = new Article(article, { feed: {} })
+      return parsed.testFilters(filters).passed
+    })
+    return {
+      articleList: filtered,
+      idType
+    }
   }
 
   /**
@@ -194,18 +270,46 @@ class FeedFetcher {
    * @returns {object|null} - Either null, or an article object
    */
   static async fetchRandomArticle (url, filters) {
+    const { articleList } = filters
+      ? await this.fetchFilteredFeed(url, filters)
+      : await this.fetchFeed(url)
+    if (articleList.length === 0) {
+      return null
+    }
+    return articleList[Math.round(Math.random() * (articleList.length - 1))]
+  }
+
+  static async fetchLatestArticle (url) {
     const { articleList } = await this.fetchFeed(url)
-    if (articleList.length === 0) return null
-    if (!filters) {
-      return articleList[Math.round(Math.random() * (articleList.length - 1))]
+    if (articleList.length === 0) {
+      return null
     }
-    const filtered = []
-    for (const article of articleList) {
-      if (testFilters(filters, new Article(article, { dateSettings: {} })).passed) {
-        filtered.push(article)
-      }
+    const allHaveValidDates = articleList.every(article => {
+      const date = new Date(article.pubDate)
+      return !isNaN(date.getTime())
+    })
+    if (!allHaveValidDates) {
+      return null
     }
-    return filtered.length === 0 ? null : filtered[Math.round(Math.random() * (filtered.length - 1))]
+    return articleList.sort((a, b) => {
+      return new Date(b.pubDate) - new Date(a.pubDate)
+    })[0]
+  }
+
+  /**
+   * @param {Object<string, any>} response
+   */
+  static getCharsetFromResponse (response) {
+    const headers = response.headers
+    const contentType = headers['content-type']
+    if (!contentType) {
+      return null
+    }
+    const match = /charset(?:=?)(.*)(?:$|\s)/ig.exec(contentType)
+    if (match && match[1]) {
+      return match[1]
+    }
+    return null
   }
 }
 

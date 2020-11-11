@@ -1,12 +1,9 @@
 const Discord = require('discord.js')
-const log = require('../../util/logger.js')
 
-exports.normal = function (bot, message) {
-  const pong = new Discord.RichEmbed()
+module.exports = async (message) => {
+  const pong = new Discord.MessageEmbed()
     .setTitle('Sending')
     .setDescription('pong!')
 
-  message.channel.send({ embed: pong }).catch(err => log.owner.warning(`Could not send the pong embed`, err))
+  await message.channel.send({ embed: pong })
 }
-
-exports.sharded = exports.normal

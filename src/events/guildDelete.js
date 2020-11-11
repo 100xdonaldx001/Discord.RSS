@@ -1,20 +1,16 @@
-const dbOpsGuilds = require('../util/db/guilds.js')
-const channelTracker = require('../util/channelTracker.js')
-const log = require('../util/logger.js')
-const RedisGuild = require('../structs/db/Redis/Guild.js')
+const GuildData = require('../structs/GuildData.js')
+const createLogger = require('../util/logger/create.js')
 
 module.exports = async guild => {
-  log.guild.info(`Guild (Users: ${guild.members.size}) has been removed`, guild)
-  RedisGuild.utils.forget(guild).catch(err => log.general.error(`Redis failed to forget after guildDelete event`, guild, err))
-
-  guild.channels.forEach((channel, channelId) => {
-    if (channelTracker.hasActiveMenus(channelId)) channelTracker.remove(channelId)
-  })
+  const log = createLogger(guild.shard.id)
+  log.info({ guild }, `Guild (Members: ${guild.memberCount}) has been removed`)
   try {
-    const guildRss = await dbOpsGuilds.get(guild.id)
-    if (!guildRss) return
-    await dbOpsGuilds.remove(guildRss, true)
+    const guildData = await GuildData.get(guild.id)
+    await guildData.delete()
   } catch (err) {
-    log.guild.warning(`Unable to delete guild from database`, guild, err)
+    log.warn({
+      error: err,
+      guild
+    }, 'Failed to remove data of guild')
   }
 }
